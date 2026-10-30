@@ -1,0 +1,142 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+[COMPUTESHADER]
+
+#include <Shaders/Common/Common.h>
+#include <Shaders/Fluid/FluidCommon.h>
+
+// Snow accumulation, slumping, drift and recovery.
+//
+// State: (packed depth, compression, loose depth, disturbance), depths in metres. Disturbance is how much snow a press
+// recently kicked up here; the injection pass adds and decays it, this pass leaves it alone, and it drives the drift
+// spray. Snowfall and wind moving loose snow deliberately do NOT count, so the spray only answers to something
+// actually disturbing the surface.
+//
+// The injection pass has already sunk whatever was pressed this step and thrown part of it up as loose snow. This
+// pass moves that loose snow: it slides down any slope steeper than the angle of repose, the wind carries it
+// downwind, it banks up where it runs into something solid, and what stops moving settles into the packed layer.
+// Packed snow never moves, which is why a boot print keeps its shape while the spoil around it drifts away.
+//
+// Every transfer is written as a gather: a texel works out what it receives and what it loses by reading its
+// neighbours, so no two threads ever write the same texel.
+
+Texture2D<float4> FluidStateInput BIND_GROUP(BG_DRAW_CALL);
+Texture2D<float4> FluidObstacleInput BIND_GROUP(BG_DRAW_CALL);
+RWTexture2D<float4> FluidStateOutput BIND_GROUP(BG_DRAW_CALL);
+
+// Surface height a neighbour presents to the slump: packed plus loose. A solid neighbour reads as this texel's own
+// height so nothing slides into a wall.
+float SurfaceAt(int2 vTexel, float fOwnHeight, out float fLoose)
+{
+  fLoose = 0.0;
+
+  if (FluidIsSolid(FluidObstacleInput, vTexel))
+    return fOwnHeight;
+
+  float4 s = FluidLoad(FluidStateInput, vTexel);
+  fLoose = s.z;
+  return s.x + s.z;
+}
+
+[numthreads(FLUID_SOLVER_THREADS, FLUID_SOLVER_THREADS, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+  if (FluidOutOfGrid(id.xy))
+    return;
+
+  int2 vTexel = int2(id.xy);
+  float4 state = FluidStateInput.Load(int3(vTexel, 0));
+
+  // A collider standing in the snow holds nothing of its own.
+  if (FluidIsSolid(FluidObstacleInput, vTexel))
+  {
+    FluidStateOutput[id.xy] = float4(0, 1, 0, 0);
+    return;
+  }
+
+  float fPacked = state.x;
+  float fCompression = state.y;
+  float fLoose = state.z;
+
+  const int2 vOffsets[4] = {int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1)};
+  float fHere = fPacked + fLoose;
+
+  // ---- slump ----------------------------------------------------------
+  // Loose snow slides from the higher side to the lower one, but only for the part of the height difference that
+  // exceeds the angle of repose. A quarter share per neighbour keeps the exchange stable.
+  [branch]
+  if (SolverSlump > 0.0)
+  {
+    float fRepose = max(SolverRepose, 0.0);
+    float fRate = saturate(SolverSlump * SolverStepTime * 8.0) * 0.25;
+    float fDelta = 0.0;
+
+    [unroll]
+    for (int i = 0; i < 4; ++i)
+    {
+      float fNeighbourLoose;
+      float fNeighbour = SurfaceAt(vTexel + vOffsets[i], fHere, fNeighbourLoose);
+
+      // Receive from a higher neighbour, give to a lower one. Only loose snow can move.
+      float fIncoming = min(max((fNeighbour - fHere) - fRepose, 0.0) * 0.5, fNeighbourLoose);
+      float fOutgoing = min(max((fHere - fNeighbour) - fRepose, 0.0) * 0.5, fLoose);
+
+      fDelta += (fIncoming - fOutgoing) * fRate;
+    }
+
+    fLoose = max(fLoose + fDelta, 0.0);
+  }
+
+  // ---- drift ----------------------------------------------------------
+  // The wind carries the loose layer downwind. Packed snow is untouched, so a wind that would strip a fresh
+  // footprint's spoil leaves the print itself intact.
+  [branch]
+  if (SolverWind.x != 0.0 || SolverWind.y != 0.0)
+  {
+    float fWindSpeed = length(SolverWind);
+    float2 vWindDir = SolverWind / fWindSpeed;
+    float fRate = saturate(fWindSpeed * SolverStepTime / max(SolverTexelSize, 1e-6));
+
+    int2 vUpwind = vTexel - int2(round(vWindDir));
+    int2 vDownwind = vTexel + int2(round(vWindDir));
+
+    float fUpwindLoose = FluidIsSolid(FluidObstacleInput, vUpwind) ? 0.0 : FluidLoad(FluidStateInput, vUpwind).z;
+
+    // Snow blows in from upwind, and blows on downwind unless something solid is in the way. A wall therefore
+    // grows a bank on the side the wind is pushing the snow against.
+    float fLeaving = FluidIsSolid(FluidObstacleInput, vDownwind) ? 0.0 : fLoose;
+
+    fLoose = max(fLoose + (fUpwindLoose - fLeaving) * fRate, 0.0);
+  }
+
+  // ---- snowfall and settling ------------------------------------------
+  // Fresh snow lands loose, so it drifts and banks like real falling snow before it consolidates.
+  fLoose += SolverAccumulation;
+
+  float fSettled = fLoose * saturate(SolverSettle);
+  fLoose -= fSettled;
+  fPacked += fSettled;
+
+  // Snowfall is what fills a print back in and smooths the compression away with it.
+  [branch]
+  if (SolverAccumulation > 0.0)
+  {
+    fPacked += SolverRefill * fCompression;
+    fCompression = max(fCompression - SolverRefill * 20.0, 0.0);
+  }
+
+  // The cap applies to the surface as a whole, so drifts cannot grow without limit.
+  float fTotal = fPacked + fLoose;
+  if (fTotal > SolverMaxDepth)
+  {
+    float fScale = SolverMaxDepth / max(fTotal, 1e-6);
+    fPacked *= fScale;
+    fLoose *= fScale;
+  }
+
+  // The disturbance signal is owned by the injection pass (it adds and decays it); this pass carries it through.
+  FluidStateOutput[id.xy] = float4(max(fPacked, 0.0), saturate(fCompression), max(fLoose, 0.0), state.w);
+}

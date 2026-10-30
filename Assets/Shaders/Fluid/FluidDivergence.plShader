@@ -1,0 +1,64 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+[COMPUTESHADER]
+
+#include <Shaders/Common/Common.h>
+#include <Shaders/Fluid/FluidSources.h>
+
+// Divergence of the velocity field, and a zeroed pressure field for the Jacobi solve that follows. Solid neighbours
+// contribute the wall's own velocity, which is zero, so fluid neither enters nor leaves a collider. Draining Vortex
+// sources add a sink term, so the projection leaves an inflow toward their centre instead of removing it.
+
+Texture2D<float4> FluidStateInput BIND_GROUP(BG_DRAW_CALL);
+Texture2D<float4> FluidObstacleInput BIND_GROUP(BG_DRAW_CALL);
+RWTexture2D<float> FluidDivergenceOutput BIND_GROUP(BG_DRAW_CALL);
+RWTexture2D<float> FluidPressureOutput BIND_GROUP(BG_DRAW_CALL);
+
+float2 VelocityAt(int2 vTexel)
+{
+  // A solid neighbour contributes the wall's velocity, which is zero.
+  if (FluidIsSolid(FluidObstacleInput, vTexel))
+    return float2(0, 0);
+
+  return FluidLoad(FluidStateInput, vTexel).xy;
+}
+
+[numthreads(FLUID_SOLVER_THREADS, FLUID_SOLVER_THREADS, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+  if (FluidOutOfGrid(id.xy))
+    return;
+
+  int2 vTexel = int2(id.xy);
+
+  float2 vRight = VelocityAt(vTexel + int2(1, 0));
+  float2 vLeft = VelocityAt(vTexel - int2(1, 0));
+  float2 vUp = VelocityAt(vTexel + int2(0, 1));
+  float2 vDown = VelocityAt(vTexel - int2(0, 1));
+
+  float fDivergence = 0.5 * ((vRight.x - vLeft.x) + (vUp.y - vDown.y));
+
+  // A draining vortex is a uniform sink over its core. An inflow of Drain (m/s) at the core edge spread over the core
+  // is a divergence of -2 Drain / Radius per texel, the same units as the finite difference above; adding it to the
+  // right-hand side makes the solve leave exactly that inflow behind. Drain is capped at half a texel per step so the
+  // inflow it creates cannot outrun the advection step.
+  float2 vTexelPos = float2(vTexel) + 0.5;
+  float fMaxDrain = 0.5 * SolverTexelSize / max(SolverStepTime, 1e-4);
+  uint2 vRange = FluidSourceRange(id.xy);
+  for (uint i = 0; i < vRange.y; ++i)
+  {
+    plFluidSourceGpu src = FluidSources[FluidSourceIndices[vRange.x + i]];
+    if ((uint)src.Shape != FLUID_SOURCE_VORTEX || src.Drain <= 0.0)
+      continue;
+
+    float fRadius = max(src.Radius, 1.0);
+    float fCore = FluidVortexCore(length(vTexelPos - src.Position), fRadius) * saturate(1.0 - src.HeightFade);
+    fDivergence += 2.0 * min(src.Drain, fMaxDrain) / fRadius * fCore;
+  }
+
+  FluidDivergenceOutput[id.xy] = fDivergence;
+  FluidPressureOutput[id.xy] = 0.0;
+}

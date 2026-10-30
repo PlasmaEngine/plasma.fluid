@@ -1,0 +1,47 @@
+// plasma.fluid - real-time 2.5D GPU fluid simulation for water, smoke, weather and snow.
+//
+// The AUTHORED manifest, kept in source next to the plugin. Component hashes and sizes are NOT
+// here: the packaging step computes those and emits them into the published manifest.
+//
+// Field reference and validation rules: Docs/PluginPackageManagerPlan.html §05.
+// Design: Documentation/fluid-simulation-package-plan.html
+
+PackageInfo
+{
+	string %Id{"plasma.fluid"}
+	string %Version{"0.3.2"}
+	string %Publisher{"PlasmaTechnology"}
+	string %License{"MIT"}
+	string %Homepage{"https://plasmagameengine.com"}
+
+	string %MinEngineVersion{"0.11.2"}
+	string %MaxEngineVersion{"0.11.2"}
+	string %AbiTag{"win64-msvc19-0.11.2-abi6-dev"}
+
+	string %DisplayName{"Fluid"}
+	string %Category{"Rendering"}
+	string %Description{"Fluid Volumes run a grid fluid solver on the GPU every frame and publish velocity, density, height, foam and wetness that any material, particle system or pipeline pass can sample by world position. Three modes: Gas for smoke, dust and fog; Water for shallow water with waves, currents, whirlpools, run-up on beaches and a wet map; Snow for accumulating and trampled ground cover. Emitters, colliders, physics bodies, characters, scene wind and weather all drive it. Works with no other package installed."}
+
+	string %Icon{"Branding/FluidIcon.png"}
+	string %Banner{"Branding/FluidBanner.png"}
+	// The runtime plugin only. The Fluid Preset asset and its editor window are a later phase; until then a Fluid
+	// Volume runs on its own Settings or the built-in solver defaults.
+	string %EditorPlugins{}
+	string %EditorEnginePlugins{}
+	string %RuntimePlugins{"plFluidPlugin"}
+	string %PackageDependencies{}
+
+	Requires { string %Id{"plasma.assets"} string %Range{"^1.0"} }
+
+	// ---- assets ---------------------------------------------------------------
+	// Mounted as a data directory when the package is installed; solver shaders resolve as Shaders/Fluid/...
+	// The consumer-facing headers (FluidConstants.h, FluidSample.h) ship with the ENGINE, not here, because
+	// engine material shaders include them.
+	Mount { string %Path{"Assets"} string %RootName{"plasma.fluid"} bool %Writable{false} }
+
+	Component { string %Name{"assets"} string %Platform{"any"} }
+	Component { string %Name{"manifest"} string %Platform{"any"} }
+	Component { string %Name{"icon"} string %Platform{"any"} }
+	Component { string %Name{"banner"} string %Platform{"any"} }
+	Component { string %Name{"runtime-win64"} string %Platform{"win64"} }
+}

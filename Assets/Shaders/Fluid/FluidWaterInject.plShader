@@ -1,0 +1,182 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+[COMPUTESHADER]
+
+#include <Shaders/Common/Common.h>
+#include <Shaders/Fluid/FluidSources.h>
+#include <Shaders/Fluid/FluidWaterCommon.h>
+
+// Applies every emitter, touch source and scripted impulse to a Water volume once per frame, before its sub-steps.
+//   HeightImpulse becomes a surface pressure head (FLUID_WATER_PRESSURE_TIME), which the velocity step turns into a
+//     dent, a bow wave and a wake without adding or removing water.
+//   A moving source, or one with a velocity of its own, drags the face velocities it covers toward that velocity.
+//   A Vortex relaxes the face velocities onto a Rankine swirl and, with Drain, sinks water in its core.
+//   Density adds foam. Rain drops are one-frame pressure spikes.
+// It also advances the wet map from the depth at the start of the frame.
+
+Texture2D<float4> FluidAuxInput BIND_GROUP(BG_DRAW_CALL); // x: wet map, y: last frame's pressure head
+RWTexture2D<float4> FluidStateOutput BIND_GROUP(BG_DRAW_CALL);
+RWTexture2D<float4> FluidAuxOutput BIND_GROUP(BG_DRAW_CALL);
+
+// Rankine swirl of a Vortex source at a texel-space position: tangential Swirl and inflow Drain at the core edge, rising
+// linearly inside the core and falling off as 1/r outside. Returns the target velocity; out_fReach is how strongly the
+// source pulls toward it there.
+float2 VortexTarget(plFluidSourceGpu src, float2 vPos, out float out_fReach)
+{
+  float fRadius = max(src.Radius, 1.0);
+  float2 vDelta = vPos - src.Position;
+  float fDist = length(vDelta);
+  out_fReach = FluidVortexReach(fDist, fRadius) * saturate(1.0 - src.HeightFade);
+
+  float2 vRadial = vDelta / max(fDist, 1e-3);
+  float2 vTangent = float2(-vRadial.y, vRadial.x); // counter-clockwise seen from +Z
+
+  // Turbulence: the swirl is not the same all the way round. Spiral arms of stronger and weaker flow turn with it,
+  // so the surface heaves and sheds waves that the current winds up instead of a glassy, steady funnel.
+  float fUnsteady = 1.0;
+  [branch]
+  if (SolverTurbulence > 0.0)
+  {
+    float fAngle = atan2(vDelta.y, vDelta.x);
+    float fArms = sin(3.0 * fAngle - fDist / fRadius * 2.5 - SolverTime * 1.7) * 0.6 + sin(5.0 * fAngle + fDist / fRadius * 1.5 + SolverTime * 2.9) * 0.4;
+    fArms += FluidNoiseFbm(float3(vPos * SolverTexelSize * 0.25, SolverTime * 0.5)) * 0.8;
+    fUnsteady += SolverTurbulence * 0.45 * fArms;
+  }
+
+  return (vTangent * src.Swirl - vRadial * max(src.Drain, 0.0)) * FluidVortexShape(fDist, fRadius) * fUnsteady;
+}
+
+[numthreads(FLUID_SOLVER_THREADS, FLUID_SOLVER_THREADS, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+  if (FluidOutOfGrid(id.xy))
+    return;
+
+  int2 vTexel = int2(id.xy);
+  float4 state = FluidStateInput.Load(int3(vTexel, 0));
+  float4 aux = FluidAuxInput.Load(int3(vTexel, 0));
+
+  float fBed = WaterBedAt(vTexel);
+  float fDepth = WaterSurface(state.x, fBed) - fBed;
+  float fStep = SolverStepTime;
+
+  // The wet map holds 1 while a texel is under water and fades over the Wet Memory once it runs dry.
+  float fWet = fDepth > SolverDryDepth ? 1.0 : max(aux.x - SolverWetFade, 0.0);
+
+  // A collider holds no flow; its water waits under it until it moves away.
+  if (FluidIsSolid(FluidObstacleInput, vTexel))
+  {
+    FluidStateOutput[id.xy] = float4(state.x, 0.0, 0.0, state.w);
+    FluidAuxOutput[id.xy] = float4(fWet, 0.0, 0.0, 0.0);
+    return;
+  }
+
+  float2 vCell = float2(vTexel) + 0.5;
+  float2 vFaceX = vCell + float2(0.5, 0.0); // the x face this texel owns
+  float2 vFaceY = vCell + float2(0.0, 0.5); // the y face this texel owns
+
+  float fEta = state.x;
+  float fU = state.y;
+  float fV = state.z;
+  float fFoam = state.w;
+  float fPressure = 0.0;
+
+  uint2 vRange = FluidSourceRange(id.xy);
+  for (uint i = 0; i < vRange.y; ++i)
+  {
+    plFluidSourceGpu src = FluidSources[FluidSourceIndices[vRange.x + i]];
+
+    if ((uint)src.Shape == FLUID_SOURCE_VORTEX)
+    {
+      // 3 per second: enough to hold the swirl against friction, loose enough that waves crossing the vortex are not
+      // wiped out every frame.
+      float fRelax = saturate(3.0 * fStep);
+      float fReachX, fReachY;
+      float2 vTargetX = VortexTarget(src, vFaceX, fReachX);
+      float2 vTargetY = VortexTarget(src, vFaceY, fReachY);
+      fU = lerp(fU, vTargetX.x, fRelax * fReachX);
+      fV = lerp(fV, vTargetY.y, fRelax * fReachY);
+
+      float fRadius = max(src.Radius, 1.0);
+      float fCore = FluidVortexCore(length(vCell - src.Position), fRadius) * saturate(1.0 - src.HeightFade);
+      if (fCore > 0.0)
+      {
+        // A drain removes the water its inflow brings: Drain across the core's rim, spread over the core. The surface
+        // falls until the inflow keeps up. Foam in the core is swallowed with it.
+        float fCoreMetres = fRadius * SolverTexelSize;
+        float fDrain = max(src.Drain, 0.0);
+        fEta -= 2.0 * fDepth * fDrain / max(fCoreMetres, 1e-3) * fCore * fStep;
+        fFoam += src.Density * fCore * fStep;
+        // Swallowed a few times faster than the inflow alone would take it under, so the core does not fill up.
+        fFoam *= exp(-4.0 * fCore * fDrain * fStep / max(fCoreMetres, 1e-3));
+      }
+      continue;
+    }
+
+    float fFade = saturate(1.0 - src.HeightFade);
+    float fWeight = FluidSourceWeight(src, vCell) * fFade;
+
+    // A moving source drags the water it covers toward its own velocity, at 10 per second, so the water there never
+    // runs faster than the source does. A still source leaves the velocity alone.
+    if (dot(src.Velocity, src.Velocity) > 1e-6)
+    {
+      float fDrag = saturate(10.0 * fStep);
+      fU = lerp(fU, src.Velocity.x, fDrag * FluidSourceWeight(src, vFaceX) * fFade);
+      fV = lerp(fV, src.Velocity.y, fDrag * FluidSourceWeight(src, vFaceY) * fFade);
+    }
+
+    if (fWeight <= 0.0)
+      continue;
+
+    fPressure -= src.HeightImpulse * FLUID_WATER_PRESSURE_TIME * fWeight;
+    fFoam += src.Density * fWeight * fStep;
+  }
+
+  // Rain: drops land at random in cells twice their radius across, at a rate spread over the whole grid. A drop is a
+  // soft pressure bump over its radius for one step, which rings out as a ring. A texel gathers the drops of the cells
+  // around its own; a drop only one texel wide would ring as grid noise instead.
+  [branch]
+  if (SolverRainRate > 0.0)
+  {
+    float fRadius = max(SolverRainRadius, 1.5);
+    float fCellSize = 2.0 * fRadius;
+    float2 vCells = max(float2(SolverRes) / fCellSize, 1.0);
+    float fPerCell = SolverRainRate / (vCells.x * vCells.y);
+    int2 vHome = int2(floor(vCell / fCellSize));
+
+    [unroll]
+    for (int dy = -1; dy <= 1; ++dy)
+    {
+      [unroll]
+      for (int dx = -1; dx <= 1; ++dx)
+      {
+        uint2 vDropCell = uint2(vHome + int2(dx, dy) + 4096);
+        if (FluidRandom(vDropCell, 17u) >= fPerCell)
+          continue;
+
+        float2 vDrop = (float2(vHome + int2(dx, dy)) + float2(FluidRandom(vDropCell, 29u), FluidRandom(vDropCell, 31u))) * fCellSize;
+        float fFalloff = exp(-2.0 * dot(vCell - vDrop, vCell - vDrop) / (fRadius * fRadius));
+        fPressure += 0.03 * fFalloff;
+        fFoam += 0.03 * fFalloff;
+      }
+    }
+  }
+
+  // Chop: a field of pressure that drifts and churns raises waves everywhere, at about the chop cell's wavelength.
+  // The solver then carries them with the current, so around a vortex they wind into spirals of their own accord.
+  [branch]
+  if (SolverChop > 0.0)
+  {
+    float3 p = float3(vCell * SolverTexelSize / max(SolverChopScale, 0.1), SolverTime * SolverChopRate);
+    fPressure += SolverChop * FluidNoiseFbm(p);
+  }
+
+  // A drain can only take the water that is there.
+  fEta = max(fEta, fBed);
+
+  FluidStateOutput[id.xy] = float4(fEta, fU, fV, clamp(fFoam, 0.0, 2.0));
+  FluidAuxOutput[id.xy] = float4(fWet, fPressure, 0.0, 0.0);
+}

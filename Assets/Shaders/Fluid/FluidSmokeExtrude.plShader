@@ -1,0 +1,37 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+[COMPUTESHADER]
+
+#include <Shaders/Common/Common.h>
+#include <Shaders/Fluid/FluidCommon.h>
+
+// Extrudes a Gas volume's 2D state into the 3D smoke texture the VDB volume renderer draws. Every column of voxels
+// takes the density and temperature of the grid texel under it, shaped across the slab by a thickness profile that is
+// thickest at the plane and thinner where the smoke itself is thin, so dense plumes read as volumes and wisps stay
+// wisps. Output packing is what VDBVolume.hlsli reads: density in r, temperature in g.
+
+Texture2D<float4> FluidStateInput BIND_GROUP(BG_DRAW_CALL);
+RWTexture3D<float4> FluidSmokeOutput BIND_GROUP(BG_DRAW_CALL);
+
+[numthreads(FLUID_SOLVER_THREADS, FLUID_SOLVER_THREADS, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+  if (any(id >= SolverSmokeDims.xyz))
+    return;
+
+  float2 vUv = (float2(id.xy) + 0.5) / float2(SolverSmokeDims.xy);
+  float fW = (float(id.z) + 0.5) / float(SolverSmokeDims.z);
+
+  // Gas packing: (velocity.x, velocity.y, density, temperature)
+  float4 state = FluidSampleBilinear(FluidStateInput, vUv * float2(SolverRes));
+  float fDensity = max(state.z, 0.0);
+  float fTemperature = max(state.w, 0.0);
+
+  float fProfile = pow(saturate(1.0 - abs(fW * 2.0 - 1.0)), max(SolverSmokeFalloff, 0.0));
+  fProfile *= saturate(fDensity);
+
+  FluidSmokeOutput[id] = float4(fDensity * fProfile, fTemperature * fProfile, 0.0, 0.0);
+}

@@ -1,0 +1,163 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+[COMPUTESHADER]
+
+#include <Shaders/Common/Common.h>
+#include <Shaders/Fluid/FluidWaterCommon.h>
+
+// Mass half of one Water sub-step, run after FluidWaterVelocity. The surface of every texel moves by the water its
+// four faces carry in and out, each face carrying its velocity times the depth of the texel upstream of it, so water
+// is conserved and a dry texel only fills from a wet neighbour. An Open volume's sponge relaxes the surface toward rest.
+//
+// Foam rides the flow (semi-Lagrangian) and decays. It is made where waves break (converging flow, steep slopes in
+// shallow water), in the swash zone and against colliders (moving water in the last few decimetres of depth or next to
+// a dry or solid texel), and where the flow shears: the wakes behind rocks and hulls, the edges of currents. New foam
+// comes in scattered specks the flow stretches into streaks.
+
+RWTexture2D<float4> FluidStateOutput BIND_GROUP(BG_DRAW_CALL);
+
+struct Neighbour
+{
+  float m_fEta;   // surface
+  float m_fDepth; // 0 when dry
+  bool m_bDry;
+  bool m_bSolid;
+};
+
+Neighbour LoadNeighbour(int2 vTexel, float fEtaHere)
+{
+  Neighbour n;
+
+  // Outside a wall-bounded volume: a wall, level with this texel.
+  if (SolverBoundary != FLUID_BOUNDARY_WRAP && WaterIsOutside(vTexel))
+  {
+    n.m_fEta = fEtaHere;
+    n.m_fDepth = 0.0;
+    n.m_bDry = false;
+    n.m_bSolid = true;
+    return n;
+  }
+
+  vTexel = FluidWrapTexel(vTexel);
+  float fBed = WaterBedAt(vTexel);
+  n.m_fEta = WaterSurface(FluidStateInput.Load(int3(vTexel, 0)).x, fBed);
+  n.m_fDepth = n.m_fEta - fBed;
+  n.m_bDry = n.m_fDepth < SolverDryDepth;
+  n.m_bSolid = FluidIsSolid(FluidObstacleInput, vTexel);
+  return n;
+}
+
+[numthreads(FLUID_SOLVER_THREADS, FLUID_SOLVER_THREADS, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+  if (FluidOutOfGrid(id.xy))
+    return;
+
+  int2 vTexel = int2(id.xy);
+  float4 here = FluidStateInput.Load(int3(vTexel, 0));
+  float fDt = SolverSubStepTime;
+  float fInvTexel = 1.0 / max(SolverTexelSize, 1e-6);
+
+  if (FluidIsSolid(FluidObstacleInput, vTexel))
+  {
+    FluidStateOutput[id.xy] = float4(here.x, 0.0, 0.0, here.w * SolverFoamDecay);
+    return;
+  }
+
+  float fBed = WaterBedAt(vTexel);
+  float fEta = WaterSurface(here.x, fBed);
+  float fDepth = fEta - fBed;
+
+  Neighbour right = LoadNeighbour(vTexel + int2(1, 0), fEta);
+  Neighbour left = LoadNeighbour(vTexel - int2(1, 0), fEta);
+  Neighbour up = LoadNeighbour(vTexel + int2(0, 1), fEta);
+  Neighbour down = LoadNeighbour(vTexel - int2(0, 1), fEta);
+
+  float fURight = here.y;
+  float fVUp = here.z;
+  float fULeft = WaterFaceU(vTexel - int2(1, 0));
+  float fVDown = WaterFaceV(vTexel - int2(0, 1));
+
+  // ---- mass -------------------------------------------------------------
+  // Upwind depth on each face: the water a face carries comes from the texel it flows out of.
+  float fFluxRight = fURight * (fURight > 0.0 ? fDepth : right.m_fDepth);
+  float fFluxLeft = fULeft * (fULeft > 0.0 ? left.m_fDepth : fDepth);
+  float fFluxUp = fVUp * (fVUp > 0.0 ? fDepth : up.m_fDepth);
+  float fFluxDown = fVDown * (fVDown > 0.0 ? down.m_fDepth : fDepth);
+
+  float fNewEta = fEta - fDt * fInvTexel * ((fFluxRight - fFluxLeft) + (fFluxUp - fFluxDown));
+
+  // The sponge settles the surface back to rest, which absorbs waves and lets the border region act as open water
+  // that a drain or a current can draw from.
+  float fSponge = WaterSponge(vTexel);
+  if (fSponge > 0.0)
+    fNewEta = lerp(fNewEta, 0.0, 1.0 - exp(-10.0 * fSponge * fDt));
+
+  // Ground above the rest level soaks up the water that runs onto it, so the run-up of waves drains away instead of
+  // pooling on a beach crest the sea can never take it back from.
+  if (fBed > 0.0)
+    fNewEta -= FLUID_WATER_INFILTRATION * fDt;
+
+  fNewEta = max(fNewEta, fBed);
+  float fNewDepth = fNewEta - fBed;
+
+  // ---- foam -------------------------------------------------------------
+  float2 vVelocity = 0.5 * float2(fULeft + fURight, fVDown + fVUp);
+  float2 vBack = float2(vTexel) + 0.5 - vVelocity * fDt * fInvTexel;
+  float fFoam = FluidSampleBilinear(FluidStateInput, vBack).w;
+
+  if (fNewDepth >= SolverDryDepth)
+  {
+    float fSpeed = length(vVelocity);
+
+    // Breaking: flow converging faster than 0.3 per second, and in shallow water a surface steeper than about 1 in 7,
+    // where a wave grows too tall for the depth under it. A steady slope in deep water, such as the wall of a
+    // whirlpool, does not break.
+    float fDivergence = ((fURight - fULeft) + (fVUp - fVDown)) * fInvTexel;
+    float2 vSlope = 0.5 * float2(right.m_fEta - left.m_fEta, up.m_fEta - down.m_fEta) * fInvTexel;
+    float fSlope = length(vSlope);
+    float fShallowBreaking = 4.0 * max(fSlope - 0.15, 0.0) * saturate(1.0 - fNewDepth / 1.5);
+
+    // A front at any depth: water running close to its own wave speed is a bore, and a face steeper than about 20
+    // degrees that the water runs down in its direction of travel is a wave tumbling over. Flow along a slope, round a
+    // whirlpool's wall, is neither.
+    float fFroude = fSpeed / sqrt(9.81 * max(fNewDepth, 0.05));
+    float fDownFace = fSpeed > 0.1 && fSlope > 1e-4 ? saturate(dot(vVelocity / fSpeed, -vSlope / fSlope)) : 0.0;
+    float fFront = 3.0 * max(fFroude - 0.8, 0.0) + 3.0 * max(fSlope - 0.35, 0.0) * fDownFace * fDownFace;
+
+    float fBreaking = max(-fDivergence - 0.3, 0.0) + fShallowBreaking + fFront;
+
+    // Swash zone and contact: moving water in the last 0.3 m of depth, or next to dry ground or a collider.
+    bool bContact = right.m_bDry || left.m_bDry || up.m_bDry || down.m_bDry || right.m_bSolid || left.m_bSolid || up.m_bSolid || down.m_bSolid;
+    float fSwash = max(saturate(1.0 - fNewDepth / 0.3), bContact ? 1.0 : 0.0);
+
+    // Shear: the strain of the flow, which is what tears the surface where a current passes still water or flows
+    // round a rock. Vorticity alone would not do: a vortex core turns like a solid body and stays glassy.
+    float fVRight = WaterFaceV(vTexel + int2(1, 0));
+    float fUUp = WaterFaceU(vTexel + int2(0, 1));
+    float fNormalStrain = ((fURight - fULeft) - (fVUp - fVDown)) * fInvTexel;
+    float fShearStrain = ((fVRight - fVUp) + (fUUp - fURight)) * fInvTexel;
+    float fStrain = sqrt(fNormalStrain * fNormalStrain + fShearStrain * fShearStrain);
+
+    float fGenerated = SolverFoamDivergence * fBreaking + SolverShoreFoam * fSpeed * fSwash + SolverFoamShear * 0.5 * max(fStrain - 1.0, 0.0);
+
+    // New foam appears in scattered specks, re-drawn a few times a second, and the flow stretches them into streaks
+    // and lace. Generated evenly it would only ever cover the water in a grey sheet.
+    uint2 vSpeck = uint2(vTexel) / 2u;
+    uint uiEpoch = (uint)(SolverTime * 3.0);
+    float fSpeck = float(FluidHash(vSpeck.x * 73856093u ^ vSpeck.y * 19349663u ^ uiEpoch * 83492791u) & 0xFFFFu) / 65535.0;
+    fFoam += fGenerated * saturate((fSpeck - 0.55) * 4.0) * 2.2 * fDt;
+
+    fFoam *= SolverFoamDecay;
+  }
+  else
+  {
+    // Foam stranded on dry ground fades within a second or so.
+    fFoam *= SolverFoamDecay * exp(-3.0 * fDt);
+  }
+
+  FluidStateOutput[id.xy] = float4(fNewEta, fURight, fVUp, clamp(fFoam, 0.0, 2.0));
+}

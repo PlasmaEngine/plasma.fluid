@@ -1,0 +1,973 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+BLEND_MODE
+RENDER_PASS
+SHADING_MODE
+TWO_SIDED
+FLIP_WINDING
+FORWARD_PASS_WRITE_DEPTH
+MSAA
+CAMERA_MODE
+SHADING_QUALITY
+GAMEOBJECT_VELOCITY
+BINDLESS_MATERIAL
+WATER_USE_REFRACTION
+WATER_USE_FOAM
+WATER_USE_SUBSURFACE
+
+[MATERIALPARAMETER]
+
+Permutation BLEND_MODE;
+Permutation SHADING_MODE;
+Permutation TWO_SIDED;
+Permutation FORWARD_PASS_WRITE_DEPTH;
+Permutation WATER_USE_REFRACTION @Default(true);
+Permutation WATER_USE_FOAM @Default(true);
+Permutation WATER_USE_SUBSURFACE @Default(true);
+
+// The simulated surface of plasma.fluid's Water volumes: height, flow, foam.
+float FluidHeightScale @Default(1.0) @Group("Fluid");
+float FluidNormalStrength @Default(1.0) @Clamp(0.0, 1.0);
+float FluidFoamStrength @Default(1.0);
+// Caps the displacement in metres, downward and upward. 0 or less is no cap.
+float FluidMaxDisplacement @Default(30.0);
+
+// A Gerstner swell over the whole surface, inside and outside the simulated area, so the two join without a seam.
+float WaveAmplitude @Default(0.18) @Group("Swell");
+float WaveLength @Default(14.0);
+float WaveDirection @Default(30.0);
+float WaveSpread @Default(0.7) @Clamp(0.0, 1.5);
+float WaveChoppiness @Default(0.7) @Clamp(0.0, 1.0);
+float WaveSpeed @Default(1.0);
+// Share of the swell a strong current tears down, where the water runs 4 m/s or faster.
+float WaveFlowDamping @Default(0.6) @Clamp(0.0, 1.0);
+
+// Breaking waves. The surface is a height field and cannot fold over, so the crest of a front is pushed forward over
+// its own face, by how far the water falls away ahead of it: the lip leans out and the face shears under it.
+// Metres ahead the fall is measured over, and how far the crest is pushed per metre of fall.
+float CurlReach @Default(1.0) @Group("Breaking");
+float CurlAmount @Default(0.6);
+// Whitewater on the face of a front, where the water runs down it.
+float FaceFoam @Default(1.0);
+
+// Ripples of the normal map. On open water they drift with the current; around a vortex they are mapped around the
+// funnel and down its wall at their true size and turn with the water.
+bool UseNormalTexture @Default(true) @Group("Ripples");
+Texture2D NormalTexture;
+float NormalStrength @Default(0.35);
+// Metres per tile of the normal map.
+float NormalScale @Default(3.0);
+float FlowCycle @Default(1.2);
+// Farthest the pattern drifts per cycle on open water, in tiles, however fast the current.
+float FlowMaxTravel @Default(0.35);
+float DetailFadeDistance @Default(120.0);
+
+// The water is a medium: along every view ray under the surface light is absorbed (per channel, so deep water turns
+// blue-green) and scattered toward the camera from the sun, the sky and every light in or near the water.
+// Absorption per metre, per channel.
+Color AbsorptionColor @Default(Color(0.45, 0.075, 0.06, 1.0)) @Group("Water");
+float AbsorptionScale @Default(1.0);
+// Colour of the light the water scatters, and how much it scatters per metre.
+Color ScatterColor @Default(Color(0.35, 1.0, 0.9, 1.0));
+float ScatterDensity @Default(0.12);
+// 0 scatters evenly in all directions; toward 1 light keeps going the way it travelled, so the water glows most
+// looking toward a light.
+float ScatterAnisotropy @Default(0.35) @Clamp(0.0, 0.95);
+// Farthest the scattering is integrated below the surface, metres.
+float VolumeDistance @Default(30.0);
+float DepthFadeDistance @Default(0.25);
+// Water this far below rest level sees little of the sky: the throat of a whirlpool goes dark.
+float CavityDepth @Default(8.0);
+float CavityStrength @Default(0.6) @Clamp(0.0, 1.0);
+
+float Roughness @Default(0.08) @Clamp(0.0, 1.0) @Group("Surface");
+float RoughnessFar @Default(0.2) @Clamp(0.0, 1.0);
+float SpecularIntensity @Default(1.0);
+
+float RefractionStrength @Default(0.35) @Group("Refraction");
+float CausticsStrength @Default(1.6);
+float CausticsScale @Default(1.6);
+float CausticsSpeed @Default(1.0);
+float CausticsFade @Default(0.35);
+
+Texture2D FoamTexture @Group("Foam");
+Color FoamColor @Default(Color(0.92, 0.95, 0.97, 1.0));
+// Metres per tile of the foam texture.
+float FoamScale @Default(4.0);
+// Around a vortex, foam tiles are this many times longer along the flow than across it: streaks.
+float FoamStreak @Default(4.0);
+// Around a vortex, how far the streaks lean inward, degrees: they spiral into the funnel.
+float FoamSpiral @Default(20.0);
+float FoamSoftness @Default(0.12);
+// Most of the surface foam covers, however much foam the simulation holds.
+float FoamMaxCoverage @Default(0.6) @Clamp(0.0, 1.0);
+float CrestFoam @Default(0.6);
+float IntersectionFoamWidth @Default(0.5);
+// Faint foam lace everywhere, strongest on open water.
+float LaceStrength @Default(0.2);
+
+
+
+[RENDERSTATE]
+#include <Shaders/Materials/MaterialState.h>
+
+DepthBias = 2
+SlopeScaledDepthBias = 1.0
+
+// The water writes depth in the forward pass even though it blends: it is nearly opaque (the refraction composites
+// what is behind it), and depth is what sorts a surface that folds over itself, like a whirlpool's funnel, and what
+// lets fog, particles and later transparent passes see the water.
+#if defined(RENDER_PASS) && RENDER_PASS == RENDER_PASS_FORWARD
+DepthWrite = true
+#endif
+
+[MATERIALCONSTANTS]
+
+FLOAT1(FluidHeightScale);
+FLOAT1(FluidNormalStrength);
+FLOAT1(FluidFoamStrength);
+FLOAT1(FluidMaxDisplacement);
+FLOAT1(WaveAmplitude);
+FLOAT1(WaveLength);
+FLOAT1(WaveDirection);
+FLOAT1(WaveSpread);
+FLOAT1(WaveChoppiness);
+FLOAT1(WaveSpeed);
+FLOAT1(WaveFlowDamping);
+FLOAT1(CurlReach);
+FLOAT1(CurlAmount);
+FLOAT1(FaceFoam);
+BOOL1(UseNormalTexture);
+FLOAT1(NormalStrength);
+FLOAT1(NormalScale);
+FLOAT1(FlowCycle);
+FLOAT1(FlowMaxTravel);
+FLOAT1(DetailFadeDistance);
+COLOR4F(AbsorptionColor);
+FLOAT1(AbsorptionScale);
+COLOR4F(ScatterColor);
+FLOAT1(ScatterDensity);
+FLOAT1(ScatterAnisotropy);
+FLOAT1(VolumeDistance);
+FLOAT1(DepthFadeDistance);
+FLOAT1(CavityDepth);
+FLOAT1(CavityStrength);
+FLOAT1(Roughness);
+FLOAT1(RoughnessFar);
+FLOAT1(SpecularIntensity);
+FLOAT1(RefractionStrength);
+FLOAT1(CausticsStrength);
+FLOAT1(CausticsScale);
+FLOAT1(CausticsSpeed);
+FLOAT1(CausticsFade);
+COLOR4F(FoamColor);
+FLOAT1(FoamScale);
+FLOAT1(FoamStreak);
+FLOAT1(FoamSpiral);
+FLOAT1(FoamSoftness);
+FLOAT1(FoamMaxCoverage);
+FLOAT1(CrestFoam);
+FLOAT1(IntersectionFoamWidth);
+FLOAT1(LaceStrength);
+UINT4(BindlessTextureIndices0); // x: NormalTexture, y: FoamTexture
+UINT4(BindlessSamplerIndices0);
+
+[VERTEXSHADER]
+
+#define USE_NORMAL
+#define USE_TANGENT
+#define USE_TEXCOORD0
+#define USE_WORLD_POSITION_OFFSET
+#define CUSTOM_INTERPOLATOR float4 FluidSurface : TEXCOORD9;
+
+#if GAMEOBJECT_VELOCITY
+  #define USE_VELOCITY
+#endif
+
+#if RENDER_PASS == RENDER_PASS_EDITOR
+  #define USE_DEBUG_INTERPOLATOR
+#endif
+
+#include <Shaders/Materials/MaterialVertexShader.h>
+#include <Shaders/Fluid/FluidSample.h>
+#include <Shaders/Materials/Fluid/FluidWaterSurface.h>
+
+plFluidWaterWaves EvaluateSwell(float3 worldPosition, plFluidSample water)
+{
+  float amplitude = GetMaterialData(WaveAmplitude);
+  float waveLength = GetMaterialData(WaveLength);
+
+  // A strong current tears the swell apart, and shallow water flattens it; dry ground has none.
+  if (water.Valid)
+  {
+    float speed = length(water.Velocity);
+    amplitude *= lerp(1.0, 1.0 - saturate(GetMaterialData(WaveFlowDamping)), saturate(speed / 4.0) * water.Weight);
+    amplitude *= lerp(1.0, saturate(water.Depth / max(0.1 * waveLength, 0.05)), water.Weight);
+  }
+
+  float direction = radians(GetMaterialData(WaveDirection));
+  return FluidWaterGerstner(worldPosition.xy, GlobalTime, amplitude, waveLength, float2(cos(direction), sin(direction)),
+    GetMaterialData(WaveSpread), GetMaterialData(WaveChoppiness), GetMaterialData(WaveSpeed));
+}
+
+// The mesh is a flat plane at the rest level. The simulated surface is a height field measured along the volume's
+// normal, so it displaces along that normal whatever way the mesh faces; the swell rides on top. Where the ground is
+// dry the solver publishes a surface just under it, which hides the plane there.
+#if defined(USE_WORLD_POSITION_OFFSET)
+float3 GetWorldPositionOffset(plPerInstanceData data, float3 worldPosition)
+{
+  plFluidSample water = SampleFluidWaterSurface(worldPosition);
+  // Layer 1 of Fluid.Debug.MaterialLayers is the swell.
+  float3 offset = FluidMaterialLayer(1) ? EvaluateSwell(worldPosition, water).Displacement : float3(0, 0, 0);
+
+  if (water.Valid)
+  {
+    // 0 or less is no cap, which is also what a material transformed before the parameter existed reads.
+    float maxDisplacement = GetMaterialData(FluidMaxDisplacement);
+    maxDisplacement = maxDisplacement > 0.0 ? maxDisplacement : 1e4;
+    offset += water.Up * clamp(water.Height * GetMaterialData(FluidHeightScale), -maxDisplacement, maxDisplacement);
+
+    // The curl of a breaking front: the crest leans out over the face by how far the water falls away ahead of it.
+    // Points lower on the face see less of a fall and move less, so the face shears and the lip overhangs it.
+    float3 velocity = water.Velocity - water.Up * dot(water.Velocity, water.Up);
+    float speed = length(velocity);
+    [branch]
+    if (speed > 0.3 && GetMaterialData(CurlAmount) > 0.0)
+    {
+      float3 forward = velocity / speed;
+      plFluidSample ahead = SampleFluidWaterSurface(worldPosition + forward * GetMaterialData(CurlReach));
+      float fall = ahead.Valid ? (water.Height - ahead.Height) * GetMaterialData(FluidHeightScale) : 0.0;
+      float lean = saturate((fall - 0.15) / 0.6) * saturate(speed / 1.5);
+      offset += (forward * GetMaterialData(CurlAmount) - water.Up * 0.2) * fall * lean;
+    }
+  }
+
+  return offset;
+}
+#endif
+
+VS_OUT main(VS_IN Input)
+{
+  VS_OUT Output = FillVertexData(Input);
+
+  // The pixel shader rebuilds the normal from the simulation and the swell per pixel; the vertex normal only has to
+  // face the right way for two-sided lighting.
+  plFluidSample water = SampleFluidWaterSurface(Output.WorldPosition);
+  float3 up = water.Valid ? water.Up : float3(0, 0, 1);
+  Output.Normal = up;
+  float3 tangent = abs(up.x) < 0.9 ? float3(1, 0, 0) : float3(0, 1, 0);
+  tangent = normalize(tangent - up * dot(tangent, up));
+  Output.Tangent = tangent;
+  Output.BiTangent = cross(up, tangent);
+
+  plFluidWaterWaves swell = EvaluateSwell(Output.WorldPosition, water);
+  Output.FluidSurface = float4(swell.Crest, swell.Height, water.Valid ? water.Foam : 0.0, 0.0);
+
+  return Output;
+}
+
+[PIXELSHADER]
+
+#define USE_NORMAL
+#define USE_TANGENT
+#define USE_TEXCOORD0
+#define USE_TWO_SIDED_LIGHTING
+#define USE_DECALS
+#define USE_FOG
+#define USE_MATERIAL_EMISSIVE
+#define CUSTOM_INTERPOLATOR float4 FluidSurface : TEXCOORD9;
+
+// The screen-space GI describes the ground under the water, not the water.
+#define MATERIAL_NO_SCREEN_GI
+
+// The water's colour comes from light scattered inside it, integrated along the view ray under the surface; that needs
+// the scene behind the water, which only the forward pass has.
+#if WATER_USE_REFRACTION && WATER_USE_SUBSURFACE && RENDER_PASS == RENDER_PASS_FORWARD
+  #define WATER_VOLUME 1
+#else
+  #define WATER_VOLUME 0
+#endif
+
+#if WATER_USE_REFRACTION
+  #define USE_MATERIAL_REFRACTION
+#endif
+
+#if GAMEOBJECT_VELOCITY
+  #define USE_VELOCITY
+#endif
+
+#if RENDER_PASS == RENDER_PASS_EDITOR
+  #define USE_DEBUG_INTERPOLATOR
+#endif
+
+#include <Shaders/Materials/MaterialPixelShader.h>
+#include <Shaders/Common/Lighting.h>
+#include <Shaders/Fluid/FluidSample.h>
+#include <Shaders/Materials/Fluid/FluidWaterSurface.h>
+
+// BINDLESS_MATERIAL is declared so this material always states the variable explicitly (permutation variables persist
+// across draws). The engine only binds it TRUE for shaders listed in plMaterialManager's bindless role table; this
+// shader is not in that table, so the FALSE path is the one that renders. The TRUE path reads slot layout
+// BindlessTextureIndices0.x = NormalTexture, .y = FoamTexture, and samples without explicit gradients.
+#if BINDLESS_MATERIAL
+#include <Shaders/Common/BindlessResources.hlsli>
+#else
+Texture2D NormalTexture BIND_GROUP(BG_MATERIAL);
+SamplerState NormalTexture_AutoSampler BIND_GROUP(BG_MATERIAL);
+
+#if WATER_USE_FOAM
+Texture2D FoamTexture BIND_GROUP(BG_MATERIAL);
+SamplerState FoamTexture_AutoSampler BIND_GROUP(BG_MATERIAL);
+#endif
+#endif
+
+// Surface detail is sampled with explicit gradients: the wall frame's coordinates jump where the angle wraps and where a
+// ring band changes its tile count, so hardware derivatives would pick the smallest mip along those lines.
+float3 SampleRippleNormal(float2 uv, float2 dx, float2 dy)
+{
+#if BINDLESS_MATERIAL
+  return DecodeNormalTexture(SampleBindlessTexture2D(GetMaterialData(BindlessTextureIndices0).x, GetMaterialData(BindlessSamplerIndices0).x, uv));
+#else
+  return DecodeNormalTexture(NormalTexture.SampleGrad(NormalTexture_AutoSampler, uv, dx, dy));
+#endif
+}
+
+#if WATER_USE_FOAM
+float SampleFoamPattern(float2 uv, float2 dx, float2 dy)
+{
+#if BINDLESS_MATERIAL
+  float3 c = SampleBindlessTexture2D(GetMaterialData(BindlessTextureIndices0).y, GetMaterialData(BindlessSamplerIndices0).y, uv).rgb;
+#else
+  float3 c = FoamTexture.SampleGrad(FoamTexture_AutoSampler, uv, dx, dy).rgb;
+#endif
+  return dot(c, float3(0.3, 0.59, 0.11));
+}
+#endif
+
+// Layers Fluid.Debug.MaterialLayers can switch off.
+#define WATER_LAYER_RIPPLES 0
+#define WATER_LAYER_SWELL 1
+#define WATER_LAYER_ABSORPTION 2
+#define WATER_LAYER_CAUSTICS 3
+#define WATER_LAYER_FOAM 4
+#define WATER_LAYER_TRANSLUCENCY 5
+#define WATER_LAYER_SIM_NORMAL 6
+#define WATER_LAYER_CAVITY 7
+
+bool WaterDebugView(uint uiView)
+{
+  return FluidMaterialDebugView() == uiView;
+}
+
+// Views that replace the water with a plain opaque surface.
+bool WaterOpaqueDebugView()
+{
+  uint view = FluidMaterialDebugView();
+  return view != FLUID_DEBUG_VIEW_LIT && view != FLUID_DEBUG_VIEW_BODY;
+}
+
+float3 WaterHeatRamp(float t)
+{
+  t = saturate(t);
+  return saturate(float3(1.5 - abs(4.0 * t - 3.0), 1.5 - abs(4.0 * t - 2.0), 1.5 - abs(4.0 * t - 1.0)));
+}
+
+// Everything the surface needs is worked out once per pixel, on first use, so every entry point shares it.
+struct WaterPixel
+{
+  float3 Normal;        // final: shape and detail
+  float3 ShapeNormal;   // the simulated surface and the swell, without ripples
+  float3 Up;
+  float Foam;           // 0..1 coverage
+  float3 Transmittance; // share of the light from behind that makes it through the water, per channel
+  float3 Refracted;     // what is seen through the water, caustics included, before absorption
+  float3 Inscatter;     // light the water scatters toward the camera along the view ray under the surface
+  float EdgeAlpha;      // soft edge where the water meets geometry
+  float Cavity;         // 0..1, how much of the sky the water sees; low in the throat of a whirlpool
+  float Distance;       // metres from the camera
+  float SimHeight;      // metres, the simulated surface
+  float2 FrameUv;       // tiles of the ripple frame with the larger weight, for the frame debug view
+  float FrameWall;      // 0..1, how much of the wall frame is used
+};
+
+static bool g_WaterEvaluated = false;
+static WaterPixel g_Water;
+
+float3 WaterScattering()
+{
+  return GetMaterialData(ScatterColor).rgb * GetMaterialData(ScatterDensity);
+}
+
+float3 WaterExtinction()
+{
+  return GetMaterialData(AbsorptionColor).rgb * GetMaterialData(AbsorptionScale) + WaterScattering();
+}
+
+// Henyey-Greenstein phase function. cosTheta: between the direction the light travels and the direction it leaves in.
+float WaterPhase(float cosTheta, float g)
+{
+  float g2 = g * g;
+  return (1.0 - g2) / (4.0 * PI * pow(max(1.0 + g2 - 2.0 * g * cosTheta, 1e-4), 1.5));
+}
+
+#if RENDER_PASS == RENDER_PASS_FORWARD
+#define WATER_VOLUME_STEPS 16
+#define WATER_VOLUME_LIGHTS 4
+
+// Single scattering along the refracted view ray under the surface, from vEntry for fLength metres: at every step, the
+// light that reaches it from the sun and sky through the water above it, and from the point lights near the ray
+// through the water between, scattered toward the camera and dimmed by the water on the way back. fRestHeight is the
+// water level at rest; sunlight reaches a point through the water between it and that level.
+float3 WaterInscatter(float3 vEntry, float3 vRayDir, float fLength, float2 vScreenPos, float fRestHeight)
+{
+  float3 sigmaS = WaterScattering();
+  float3 sigmaT = WaterExtinction();
+  float g = GetMaterialData(ScatterAnisotropy);
+
+  // The sun, bent into the water.
+  bool hasSun = false;
+  float3 sunTravel = float3(0, 0, -1);
+  float3 sunLight = float3(0, 0, 0);
+  if (BrightestDirectionalLightIndex < NumLights)
+  {
+    plPerLightData sun = perLightDataBuffer[BrightestDirectionalLightIndex];
+    float3 toSun = GetLightDirection(sun);
+    if (toSun.z > 0.0)
+    {
+      float3 travel = refract(-toSun, float3(0, 0, 1), 1.0 / 1.33);
+      sunTravel = dot(travel, travel) > 1e-4 ? normalize(travel) : float3(0, 0, -1);
+      sunLight = GetLightColor(sun) * GetIntensity(sun);
+      hasSun = true;
+    }
+  }
+  float sunSlant = 1.0 / max(-sunTravel.z, 0.2);
+  float sunPhase = WaterPhase(dot(sunTravel, -vRayDir), g);
+
+  // The sky from above, as radiance spread over the upper half of the sphere.
+  float3 skyLight = EvaluateAmbientCube(SkyIrradianceTexture, SkyIrradianceIndex, float3(0, 0, 1)).rgb * 0.5;
+
+  // The point lights whose range reaches the ray.
+  uint lights[WATER_VOLUME_LIGHTS];
+  uint numLights = 0;
+  for (uint i = 0; i < NumLights && numLights < WATER_VOLUME_LIGHTS; ++i)
+  {
+    plPerLightData light = perLightDataBuffer[i];
+    if (GetLightType(light) != LIGHT_TYPE_POINT)
+      continue;
+
+    float3 toLight = light.position - vEntry;
+    float along = clamp(dot(toLight, vRayDir), 0.0, fLength);
+    float3 closest = toLight - vRayDir * along;
+    if (dot(closest, closest) * GetInvSqrAttRadius(light) < 1.0)
+      lights[numLights++] = i;
+  }
+
+  // Steps crowd toward the surface, where most of the light is; the jitter turns banding into noise TAA resolves.
+  float jitter = InterleavedGradientNoise(vScreenPos, uint(GlobalTime * 60.0));
+  float3 result = float3(0, 0, 0);
+
+  [loop]
+  for (int s = 0; s < WATER_VOLUME_STEPS; ++s)
+  {
+    float u = (s + jitter) / WATER_VOLUME_STEPS;
+    float t = fLength * u * u;
+    float dt = fLength * 2.0 * u / WATER_VOLUME_STEPS;
+    float3 p = vEntry + vRayDir * t;
+    float depth = max(fRestHeight - p.z, 0.0);
+
+    float3 incoming = skyLight * exp(-sigmaT * depth * 1.2);
+    if (hasSun)
+      incoming += sunLight * exp(-sigmaT * depth * sunSlant) * sunPhase;
+
+    for (uint l = 0; l < numLights; ++l)
+    {
+      plPerLightData light = perLightDataBuffer[lights[l]];
+      float3 toLight = light.position - p;
+      float distSqr = dot(toLight, toLight);
+      float dist = sqrt(distSqr);
+      float attenuation = DistanceAttenuation(distSqr, GetInvSqrAttRadius(light), light.falloff);
+      // A light above the water reaches the point through the water between it and the surface only.
+      float waterPath = light.position.z > fRestHeight ? dist * saturate(depth / max(light.position.z - p.z, 1e-3)) : dist;
+      incoming += GetLightColor(light) * GetIntensity(light) * attenuation * exp(-sigmaT * waterPath) * WaterPhase(dot(toLight / max(dist, 1e-4), vRayDir), g);
+    }
+
+    result += exp(-sigmaT * t) * sigmaS * incoming * dt;
+  }
+
+  return result;
+}
+#endif
+
+plFluidWaterWaves EvaluateSwellPS(float3 worldPosition, plFluidSample water)
+{
+  float amplitude = GetMaterialData(WaveAmplitude);
+  float waveLength = GetMaterialData(WaveLength);
+
+  if (water.Valid)
+  {
+    float speed = length(water.Velocity);
+    amplitude *= lerp(1.0, 1.0 - saturate(GetMaterialData(WaveFlowDamping)), saturate(speed / 4.0) * water.Weight);
+    amplitude *= lerp(1.0, saturate(water.Depth / max(0.1 * waveLength, 0.05)), water.Weight);
+  }
+
+  float direction = radians(GetMaterialData(WaveDirection));
+  return FluidWaterGerstner(worldPosition.xy, GlobalTime, amplitude, waveLength, float2(cos(direction), sin(direction)),
+    GetMaterialData(WaveSpread), GetMaterialData(WaveChoppiness), GetMaterialData(WaveSpeed));
+}
+
+// The vortex this pixel's detail is mapped around, if any.
+struct WaterVortex
+{
+  float2 Delta;      // plane xy offset from the centre, metres
+  float Radius;      // metres from the centre
+  float Core;        // core radius, metres
+  float Swirl;       // m/s at the core edge
+  float Chord;       // metres from the bottom of the funnel
+  float2 ChordDx;    // screen derivatives of Chord
+  float2 ThetaD;     // screen derivatives of the angle around the centre (x: ddx, y: ddy)
+  float Wall;        // 0..1, weight of the wall frame
+};
+
+// The wall frame of one texture: band uvs in tiles and their gradients. fTileU/fTileV: metres per tile around and down
+// the wall; fShear: tiles of u added per tile of v, which leans the pattern into a spiral.
+void WaterWallBands(WaterVortex vortex, float fTileU, float fTileV, float fShear, out float2 out_uv[2], out float2 out_dx[2], out float2 out_dy[2], out float out_fBand1)
+{
+  float tiles0;
+  FluidWaterWallUv(vortex.Delta, vortex.Chord * fTileU / fTileV, fTileU, GlobalTime, vortex.Core, vortex.Swirl, out_uv[0], out_uv[1], out_fBand1, tiles0);
+
+  [unroll]
+  for (int b = 0; b < 2; ++b)
+  {
+    float tiles = tiles0 * (b == 0 ? 1.0 : 2.0);
+    out_uv[b].x += out_uv[b].y * fShear;
+    float2 dV = vortex.ChordDx / fTileV;
+    out_dx[b] = float2(tiles / 6.2831853 * vortex.ThetaD.x + dV.x * fShear, dV.x);
+    out_dy[b] = float2(tiles / 6.2831853 * vortex.ThetaD.y + dV.y * fShear, dV.y);
+  }
+}
+
+WaterPixel EvaluateWater()
+{
+  if (g_WaterEvaluated)
+    return g_Water;
+
+  g_WaterEvaluated = true;
+
+  WaterPixel w;
+  float3 worldPos = G.Input.WorldPosition.xyz;
+  float3 cameraPos = GetCameraPosition();
+  float3 toCamera = cameraPos - worldPos;
+  w.Distance = length(toCamera);
+  float2 dPdx = ddx(worldPos.xy);
+  float2 dPdy = ddy(worldPos.xy);
+
+  plFluidSample water = SampleFluidWaterSurface(worldPos);
+  plFluidWaterWaves swell = EvaluateSwellPS(worldPos, water);
+  if (!FluidMaterialLayer(WATER_LAYER_SWELL))
+  {
+    swell.Normal = float3(0, 0, 1);
+    swell.Crest = 0.0;
+  }
+
+  // ---- shape: simulation and swell ----------------------------------------
+  w.Up = water.Valid ? water.Up : float3(0, 0, 1);
+  w.SimHeight = water.Valid ? water.Height * water.Weight : 0.0;
+  float simNormalStrength = FluidMaterialLayer(WATER_LAYER_SIM_NORMAL) ? saturate(GetMaterialData(FluidNormalStrength)) : 0.0;
+  float3 shape = water.Valid ? normalize(lerp(w.Up, water.Normal, water.Weight * simNormalStrength)) : w.Up;
+  shape = normalize(shape + (swell.Normal - float3(0, 0, 1)));
+  w.ShapeNormal = shape;
+
+  // ---- the vortex, if any --------------------------------------------------
+  WaterVortex vortex;
+  vortex.Wall = 0.0;
+  vortex.Delta = float2(1, 0); // any direction: the wall frame is weighted out where there is no vortex
+  vortex.Radius = 1.0;
+  vortex.Core = 1.0;
+  vortex.Swirl = 0.0;
+  vortex.Chord = 0.0;
+  vortex.ChordDx = float2(0, 0);
+  vortex.ThetaD = float2(0, 0);
+  {
+    float3 centre;
+    float core, swirl;
+    if (FluidWaterVortexAt(worldPos, centre, core, swirl))
+    {
+      vortex.Delta = worldPos.xy - centre.xy;
+      vortex.Radius = max(length(vortex.Delta), 1e-3);
+      vortex.Core = core;
+      vortex.Swirl = swirl;
+      // The wall frame covers the funnel and fades out between two and four core radii, where the water is nearly flat.
+      vortex.Wall = saturate((4.0 * core - vortex.Radius) / (2.0 * core));
+
+      float bottom = SampleFluidWaterSurface(centre).Height;
+      vortex.Chord = sqrt(vortex.Radius * vortex.Radius + (w.SimHeight - bottom) * (w.SimHeight - bottom));
+    }
+
+    // Derivatives in uniform control flow; the angle's are analytic so they never see its wrap.
+    vortex.ChordDx = float2(ddx(vortex.Chord), ddy(vortex.Chord));
+    float r2 = vortex.Radius * vortex.Radius;
+    vortex.ThetaD = float2(vortex.Delta.x * dPdx.y - vortex.Delta.y * dPdx.x, vortex.Delta.x * dPdy.y - vortex.Delta.y * dPdy.x) / r2;
+  }
+  w.FrameWall = vortex.Wall;
+
+  float3 wallU = normalize(float3(-vortex.Delta.y, vortex.Delta.x, 0.0) / vortex.Radius);
+  wallU = normalize(wallU - shape * dot(wallU, shape) + 1e-5);
+  float3 wallV = normalize(cross(wallU, shape));
+  float3 openU = normalize(float3(1, 0, 0) - shape * shape.x);
+  float3 openV = normalize(cross(shape, openU));
+
+  // Open water drifts with the current in two phases.
+  float2 velocity = water.Valid ? water.Velocity.xy * water.Weight : float2(0, 0);
+  float detailFade = saturate(1.0 - w.Distance / max(GetMaterialData(DetailFadeDistance), 1.0));
+
+  // ---- ripples -------------------------------------------------------------
+  float3 detail = float3(0, 0, 0);
+  float tile = max(GetMaterialData(NormalScale), 0.05);
+  w.FrameUv = worldPos.xy / tile;
+
+  const float octaveScale[2] = {1.0, 0.37};
+  const float octaveWeight[2] = {1.0, 0.55};
+
+  float2 wallUv[2], wallDx[2], wallDy[2];
+  float wallBand1;
+  WaterWallBands(vortex, tile, tile, 0.0, wallUv, wallDx, wallDy, wallBand1);
+  if (vortex.Wall > 0.5)
+    w.FrameUv = wallBand1 < 0.5 ? wallUv[0] : wallUv[1];
+
+  [branch]
+  if (GetMaterialData(UseNormalTexture) && FluidMaterialLayer(WATER_LAYER_RIPPLES))
+  {
+    [branch]
+    if (vortex.Wall > 0.0)
+    {
+      float3 wallDetail = float3(0, 0, 0);
+      [unroll]
+      for (int b = 0; b < 2; ++b)
+      {
+        float bandWeight = b == 0 ? 1.0 - wallBand1 : wallBand1;
+        [unroll]
+        for (int o = 0; o < 2; ++o)
+        {
+          float s = octaveScale[o];
+          float3 n = SampleRippleNormal(wallUv[b] / s + float2(0.37, 0.71) * o, wallDx[b] / s, wallDy[b] / s);
+          wallDetail += FluidWaterDetailOffset(n, wallU, wallV) * octaveWeight[o] * bandWeight;
+        }
+      }
+      detail += wallDetail * vortex.Wall;
+    }
+
+    [branch]
+    if (vortex.Wall < 1.0)
+    {
+      float2 driftA, driftB;
+      float flowBlend;
+      FluidWaterFlowPhases(velocity / tile, GlobalTime, GetMaterialData(FlowCycle), GetMaterialData(FlowMaxTravel), driftA, driftB, flowBlend);
+
+      float direction = radians(GetMaterialData(WaveDirection));
+      float2 windDir = float2(cos(direction), sin(direction));
+      float2 uv = worldPos.xy / tile;
+      float2 dx = dPdx / tile;
+      float2 dy = dPdy / tile;
+
+      float3 openDetail = float3(0, 0, 0);
+      [unroll]
+      for (int o = 0; o < 2; ++o)
+      {
+        // Each octave also drifts slowly downwind at its own pace, so still water never looks frozen.
+        float s = octaveScale[o];
+        float2 pan = windDir * GlobalTime * (0.04 + 0.03 * o) + float2(0.37, 0.71) * o;
+        float3 nA = SampleRippleNormal((uv + driftA) / s + pan, dx / s, dy / s);
+        float3 nB = SampleRippleNormal((uv + driftB) / s + pan, dx / s, dy / s);
+        float3 n = normalize(lerp(nA, nB, flowBlend));
+        openDetail += FluidWaterDetailOffset(n, openU, openV) * octaveWeight[o];
+      }
+      detail += openDetail * (1.0 - vortex.Wall);
+    }
+  }
+
+  w.Normal = normalize(shape + detail * GetMaterialData(NormalStrength) * lerp(0.25, 1.0, detailFade));
+
+  // ---- the cavity ----------------------------------------------------------
+  // Water below rest level sees only the sky above the funnel's mouth.
+  w.Cavity = 1.0;
+  if (FluidMaterialLayer(WATER_LAYER_CAVITY))
+  {
+    float open = saturate(1.0 + min(w.SimHeight, 0.0) / max(GetMaterialData(CavityDepth), 0.1));
+    w.Cavity = lerp(1.0, open * open, GetMaterialData(CavityStrength));
+  }
+
+  // ---- the water column and what is behind it -----------------------------
+  w.Transmittance = float3(1, 1, 1);
+  w.Refracted = float3(0, 0, 0);
+  w.Inscatter = float3(0, 0, 0);
+  float depthBehind = 1e4;
+
+  // Where the ground is dry the solver tucks the surface just under it; the depth bias of the water can still pull that
+  // in front of the ground at grazing angles, so dry water is faded out over the first centimetres of depth. The depth
+  // is taken apart from the volume's edge fade, which only blends the water into the open sea.
+  w.EdgeAlpha = water.Valid ? saturate(water.Depth / max(water.Weight, 1e-3) / 0.03) : 1.0;
+
+#if RENDER_PASS == RENDER_PASS_FORWARD
+  float2 screenPos = G.Input.Position.xy;
+  float surfaceDepth = G.Input.Position.w;
+  float3 viewDir = -toCamera / max(w.Distance, 1e-4);
+  float cosView = max(dot(viewDir, GetCameraDirForwards()), 0.05);
+
+  // Nothing behind the water (the sky) reads as depth 0 with reverse Z, and anything closer than the surface cannot be
+  // visible through it; both mean an unbounded column of water.
+  float sceneDepth = SampleSceneDepth(screenPos);
+  float straightBehind = sceneDepth > surfaceDepth + 1e-3 ? sceneDepth - surfaceDepth : 1e4;
+  w.EdgeAlpha *= saturate(straightBehind / max(GetMaterialData(DepthFadeDistance), 1e-3));
+
+  // Refraction: bend the lookup by the surface slope, more the more water there is to look through. A lookup that
+  // lands on something in front of the water keeps the straight one.
+  float3 bend = (w.Normal - w.Up * dot(w.Normal, w.Up)) * GetMaterialData(RefractionStrength) * saturate(straightBehind / 1.5);
+  float4 bentClip = mul(GetWorldToScreenMatrix(), float4(worldPos + bend, 1.0));
+  float2 bentPos = (bentClip.xy / max(bentClip.w, 1e-4) * float2(0.5, -0.5) + 0.5) * ViewportSize.xy;
+  float bentDepth = SampleSceneDepth(bentPos);
+  float bentBehind = bentDepth > surfaceDepth + 1e-3 ? bentDepth - surfaceDepth : (bentDepth <= 0.0 ? 1e4 : -1.0);
+  if (bentBehind < 0.02 || any(bentPos < 0.0) || any(bentPos > ViewportSize.xy))
+  {
+    bentPos = screenPos;
+    bentBehind = straightBehind;
+  }
+  depthBehind = bentBehind;
+
+  // The view ray under the surface: bent by the surface into the water, and as long as the water in front of what is
+  // behind it, capped by Volume Distance.
+  float viewPath = min(depthBehind / cosView, GetMaterialData(VolumeDistance));
+  w.Transmittance = FluidMaterialLayer(WATER_LAYER_ABSORPTION) ? exp(-WaterExtinction() * viewPath) : float3(0, 0, 0);
+  w.Refracted = SampleSceneColor(bentPos);
+
+#if WATER_USE_SUBSURFACE
+  [branch]
+  if (FluidMaterialLayer(WATER_LAYER_TRANSLUCENCY))
+  {
+    float3 surfaceNormal = dot(w.Normal, viewDir) < 0.0 ? w.Normal : -w.Normal;
+    float3 rayDir = refract(viewDir, surfaceNormal, 1.0 / 1.33);
+    rayDir = dot(rayDir, rayDir) > 1e-4 ? normalize(rayDir) : viewDir;
+    float restHeight = worldPos.z - w.SimHeight - swell.Height;
+    w.Inscatter = WaterInscatter(worldPos, rayDir, viewPath, screenPos, restHeight);
+  }
+#endif
+
+  // Caustics on the ground the refraction shows: the light the rippling surface focuses there, fading with the depth
+  // of water above the ground and absent above the waterline.
+  [branch]
+  if (GetMaterialData(CausticsStrength) > 0.0 && depthBehind < 60.0 && FluidMaterialLayer(WATER_LAYER_CAUSTICS))
+  {
+    float3 groundPos = SampleScenePosition(bentPos);
+    float column = dot(worldPos - groundPos, w.Up);
+    // A thin sheet of swash focuses no pattern worth the name; the caustics fade in over the first half metre.
+    float fade = exp(-GetMaterialData(CausticsFade) * column) * saturate((column - 0.1) / 0.4);
+    if (fade > 0.001)
+    {
+      float3 caustic = FluidWaterCaustics(groundPos.xy + velocity * 0.3, GlobalTime * GetMaterialData(CausticsSpeed), 1.0 / max(GetMaterialData(CausticsScale), 0.05));
+      w.Refracted *= 1.0 + GetMaterialData(CausticsStrength) * caustic * fade;
+    }
+  }
+#endif
+
+  // ---- foam ---------------------------------------------------------------
+  w.Foam = 0.0;
+#if WATER_USE_FOAM
+  [branch]
+  if (FluidMaterialLayer(WATER_LAYER_FOAM))
+  {
+    // The simulated foam sets how much of the surface the foam covers, saturating toward Foam Max Coverage, so even the
+    // foamiest water keeps dark gaps between its streaks.
+    float amount = (water.Valid ? water.Foam : 0.0) * GetMaterialData(FluidFoamStrength) + swell.Crest * GetMaterialData(CrestFoam);
+    float mask = (1.0 - exp(-1.5 * amount)) * saturate(GetMaterialData(FoamMaxCoverage));
+    float intersection = GetMaterialData(IntersectionFoamWidth) > 0.0 ? pow(1.0 - saturate(depthBehind / GetMaterialData(IntersectionFoamWidth)), 2.0) : 0.0;
+
+    // The face of a breaking front churns white: steep, and the water running down it.
+    float face = 0.0;
+    {
+      float speed = length(velocity);
+      float2 downhill = shape.xy;
+      float downhillLength = length(downhill);
+      float downFace = speed > 0.1 && downhillLength > 1e-3 ? saturate(dot(velocity / speed, downhill / downhillLength)) : 0.0;
+      float steep = saturate((1.0 - saturate(dot(shape, w.Up)) - 0.15) / 0.25);
+      face = steep * downFace * downFace * saturate(speed / 1.5) * GetMaterialData(FaceFoam);
+    }
+    mask = saturate(mask + intersection + face);
+
+    // The foam photo decides where within the mask the foam shows, brightest parts first, which is what turns a thin
+    // foam signal into lace and streaks rather than a grey veil. Around a vortex it is mapped as streaks along the
+    // flow that lean into the funnel; on open water it drifts with the current.
+    float foamTile = max(GetMaterialData(FoamScale), 0.1);
+    float pattern = 0.0;
+
+    [branch]
+    if (vortex.Wall > 0.0)
+    {
+      float2 uv[2], dx[2], dy[2];
+      float band1;
+      float streak = max(GetMaterialData(FoamStreak), 1.0);
+      float shear = tan(radians(GetMaterialData(FoamSpiral))) / streak;
+      WaterWallBands(vortex, foamTile * streak, foamTile, shear, uv, dx, dy, band1);
+      float wallPattern = lerp(SampleFoamPattern(uv[0], dx[0], dy[0]), SampleFoamPattern(uv[1], dx[1], dy[1]), band1);
+      pattern += wallPattern * vortex.Wall;
+    }
+
+    [branch]
+    if (vortex.Wall < 1.0)
+    {
+      float2 driftA, driftB;
+      float flowBlend;
+      FluidWaterFlowPhases(velocity / foamTile, GlobalTime, GetMaterialData(FlowCycle), GetMaterialData(FlowMaxTravel), driftA, driftB, flowBlend);
+      float2 uv = worldPos.xy / foamTile;
+      float2 dx = dPdx / foamTile;
+      float2 dy = dPdy / foamTile;
+      float openPattern = lerp(SampleFoamPattern(uv + driftA, dx, dy), SampleFoamPattern(uv + driftB, dx, dy), flowBlend);
+      pattern += openPattern * (1.0 - vortex.Wall);
+    }
+
+    float threshold = 1.0 - mask;
+    float softness = max(GetMaterialData(FoamSoftness), 0.01);
+    w.Foam = saturate((pattern - threshold) / softness) * saturate(mask * 6.0);
+
+    // Lace: the faint net of old foam on open water, the brightest parts of the same pattern.
+    float lace = saturate((pattern - 0.82) / 0.1) * GetMaterialData(LaceStrength) * (1.0 - 0.7 * vortex.Wall);
+    w.Foam = saturate(max(w.Foam, lace * detailFade));
+  }
+#endif
+
+  g_Water = w;
+  return w;
+}
+
+float3 GetNormal()
+{
+  WaterPixel w = EvaluateWater();
+  if (WaterDebugView(FLUID_DEBUG_VIEW_CLAY) || WaterDebugView(FLUID_DEBUG_VIEW_FOAM))
+    return w.ShapeNormal;
+  if (WaterDebugView(FLUID_DEBUG_VIEW_MIRROR))
+    return w.Up;
+  return w.Normal;
+}
+
+float3 GetDiffuseColor()
+{
+  WaterPixel w = EvaluateWater();
+
+  if (WaterDebugView(FLUID_DEBUG_VIEW_CLAY) || WaterDebugView(FLUID_DEBUG_VIEW_FOAM))
+    return float3(0.5, 0.5, 0.5);
+  if (WaterOpaqueDebugView())
+    return float3(0, 0, 0);
+
+#if WATER_VOLUME
+  // The water itself comes through the refraction; the surface only carries the foam.
+  return GetMaterialData(FoamColor).rgb * GetInstanceData().Color.rgb;
+#else
+  // Without the volume, the water scatters back its single-scattering albedo, weighted so that after the engine blends
+  // the refraction in by the mean transmittance (GetOpacity) each channel ends up by its own share.
+  float3 inscatter = 1.0 - w.Transmittance;
+  float meanInscatter = max(dot(inscatter, 1.0 / 3.0), 1e-3);
+  float3 water = WaterScattering() / WaterExtinction() * inscatter / meanInscatter * lerp(1.0, w.Cavity, 0.6);
+  return lerp(water, GetMaterialData(FoamColor).rgb, w.Foam) * GetInstanceData().Color.rgb;
+#endif
+}
+
+float GetOpacity()
+{
+  if (WaterOpaqueDebugView())
+    return 1.0;
+
+  WaterPixel w = EvaluateWater();
+#if WATER_VOLUME
+  return w.Foam;
+#else
+  float meanTransmittance = dot(w.Transmittance, 1.0 / 3.0);
+  return lerp(1.0 - meanTransmittance, 1.0, w.Foam) * w.EdgeAlpha;
+#endif
+}
+
+#if defined(USE_MATERIAL_REFRACTION)
+float4 GetRefractionColor()
+{
+  if (WaterOpaqueDebugView())
+    return float4(0, 0, 0, 1);
+
+  WaterPixel w = EvaluateWater();
+
+#if WATER_VOLUME
+  // What is behind the water, dimmed by the water in front of it, plus the light the water scatters toward the camera.
+  float3 refraction = w.Refracted * w.Transmittance + w.Inscatter;
+#else
+  // Each channel of what is behind the water survives by its own transmittance; the engine then weighs this by the
+  // mean transmittance, so the division undoes that weighting per channel.
+  float meanTransmittance = max(dot(w.Transmittance, 1.0 / 3.0), 1e-3);
+  float3 refraction = w.Refracted * w.Transmittance / meanTransmittance;
+#endif
+
+  return float4(refraction, w.EdgeAlpha * GetInstanceData().Color.a);
+}
+#endif
+
+// The specular colour is the reflectance at normal incidence: 2 % for water. Fresnel brings it up to a mirror at
+// grazing angles on its own; anything higher here turns the whole surface into chrome.
+float3 GetSpecularColor()
+{
+  if (WaterDebugView(FLUID_DEBUG_VIEW_CLAY) || WaterDebugView(FLUID_DEBUG_VIEW_FOAM))
+    return float3(0.04, 0.04, 0.04);
+  if (WaterDebugView(FLUID_DEBUG_VIEW_MIRROR))
+    return float3(0.02, 0.02, 0.02);
+  if (WaterDebugView(FLUID_DEBUG_VIEW_BODY) || (WaterOpaqueDebugView() && !WaterDebugView(FLUID_DEBUG_VIEW_SPECULAR)))
+    return float3(0, 0, 0);
+
+  // Deep in a funnel the water sees little of the sky to reflect. The cavity darkens the reflection here rather than
+  // through the engine's occlusion, whose micro-shadowing would also put out every light behind the water.
+  WaterPixel w = EvaluateWater();
+  return float3(0.02, 0.02, 0.02) * GetMaterialData(SpecularIntensity) * (1.0 - w.Foam * 0.7) * w.Cavity;
+}
+
+float GetMetallic() { return 0.0; }
+float GetReflectance() { return 0.35; }
+
+float GetRoughness()
+{
+  if (WaterDebugView(FLUID_DEBUG_VIEW_CLAY) || WaterDebugView(FLUID_DEBUG_VIEW_FOAM))
+    return 0.5;
+  if (WaterDebugView(FLUID_DEBUG_VIEW_MIRROR))
+    return 0.1;
+
+  WaterPixel w = EvaluateWater();
+  // Far away the ripples are below a pixel; a rougher lobe stands in for them instead of aliasing into sparkle noise.
+  float distant = saturate(w.Distance / max(GetMaterialData(DetailFadeDistance), 1.0));
+  float roughness = lerp(GetMaterialData(Roughness), GetMaterialData(RoughnessFar), distant) + w.Foam * 0.5;
+
+  // Below about 0.07 the sun's highlight on a mirror-flat surface exceeds what a half float target can hold and turns
+  // into infinity, which blacks out the frame through exposure and bloom. The ripples provide the sparkle instead.
+  return max(roughness, 0.09);
+}
+
+// Only the debug views emit.
+float3 GetEmissiveColor()
+{
+  // Debug views that show a value draw it as emission over black, scaled so 1 lands near white after exposure.
+  const float debugScale = 1.5;
+  if (WaterDebugView(FLUID_DEBUG_VIEW_NORMAL))
+    return (EvaluateWater().Normal * 0.5 + 0.5) * debugScale;
+  if (WaterDebugView(FLUID_DEBUG_VIEW_HEIGHT))
+  {
+    // 8 m below rest is blue, rest green-yellow, 2 m above red; one grey line per metre.
+    float h = EvaluateWater().SimHeight;
+    float contour = 1.0 - saturate(abs(frac(h + 0.5) - 0.5) * 20.0);
+    return lerp(WaterHeatRamp((h + 8.0) / 10.0), float3(0.15, 0.15, 0.15), contour * 0.7) * debugScale;
+  }
+  if (WaterDebugView(FLUID_DEBUG_VIEW_FRAME))
+  {
+    // Checker of the ripple tiles, tinted blue where the wall frame maps them.
+    WaterPixel w = EvaluateWater();
+    int2 cell = int2(floor(w.FrameUv));
+    float checker = ((cell.x + cell.y) & 1) ? 1.0 : 0.25;
+    return lerp(float3(1.0, 0.8, 0.6), float3(0.5, 0.8, 1.0), w.FrameWall) * checker * debugScale;
+  }
+  if (WaterDebugView(FLUID_DEBUG_VIEW_FOAM))
+    return float3(2.0, 0.0, 0.0) * EvaluateWater().Foam;
+  return float3(0, 0, 0);
+}

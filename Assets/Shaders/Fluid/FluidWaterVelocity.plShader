@@ -1,0 +1,135 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+[COMPUTESHADER]
+
+#include <Shaders/Common/Common.h>
+#include <Shaders/Fluid/FluidWaterCommon.h>
+
+// Momentum half of one Water sub-step. Every texel updates the velocity on its +x and +y face:
+//   semi-Lagrangian advection, so currents carry themselves and a vortex keeps its swirl;
+//   gravity on the slope of the surface plus the sources' surface pressure, which is what makes waves, a whirlpool's
+//     funnel (the slope that holds the swirl on its circle) and the pile-up in front of a rock;
+//   wind stress with gusts, Manning bed friction, damping, the swash zone's extra damping and the Open sponge.
+// Water only flows out of a wet texel, and never into or out of a collider.
+
+Texture2D<float4> FluidAuxInput BIND_GROUP(BG_DRAW_CALL); // y: surface pressure head of this frame's sources, metres
+RWTexture2D<float4> FluidStateOutput BIND_GROUP(BG_DRAW_CALL);
+
+// Smooth value noise over the plane, 0..1, for wind gusts.
+float GustNoise(float2 vPos)
+{
+  float2 i = floor(vPos);
+  float2 f = vPos - i;
+  f = f * f * (3.0 - 2.0 * f);
+
+  uint2 u = uint2(int2(i) + 4096);
+  float a = float(FluidHash(u.x * 73856093u ^ u.y * 19349663u) & 0xFFFFu) / 65535.0;
+  float b = float(FluidHash((u.x + 1) * 73856093u ^ u.y * 19349663u) & 0xFFFFu) / 65535.0;
+  float c = float(FluidHash(u.x * 73856093u ^ (u.y + 1) * 19349663u) & 0xFFFFu) / 65535.0;
+  float d = float(FluidHash((u.x + 1) * 73856093u ^ (u.y + 1) * 19349663u) & 0xFFFFu) / 65535.0;
+  return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+}
+
+// New velocity of the face between texel vTexel and vTexel + vDir, where vDir is (1, 0) or (0, 1).
+float UpdateFace(int2 vTexel, int2 vDir, float4 here, float fBedHere, float fPressureHere, bool bSolidHere)
+{
+  int2 vOther = vTexel + vDir;
+
+  // The grid border is a wall unless the volume wraps; an Open volume's sponge takes the waves before they reach it.
+  if (SolverBoundary != FLUID_BOUNDARY_WRAP && WaterIsOutside(vOther))
+    return 0.0;
+
+  vOther = FluidWrapTexel(vOther);
+
+  if (bSolidHere || FluidIsSolid(FluidObstacleInput, vOther))
+    return 0.0;
+
+  float4 other = FluidStateInput.Load(int3(vOther, 0));
+  float fBedOther = WaterBedAt(vOther);
+
+  float fEtaHere = WaterSurface(here.x, fBedHere);
+  float fEtaOther = WaterSurface(other.x, fBedOther);
+  float fDepthHere = fEtaHere - fBedHere;
+  float fDepthOther = fEtaOther - fBedOther;
+
+  if (fDepthHere < SolverDryDepth && fDepthOther < SolverDryDepth)
+    return 0.0;
+
+  float fDt = SolverSubStepTime;
+  float fInvTexel = 1.0 / max(SolverTexelSize, 1e-6);
+  float2 vFacePos = float2(vTexel) + 0.5 + 0.5 * float2(vDir);
+
+  // Advection: trace the face back along the local velocity. The component across the face is the face's own; the
+  // other one is the mean of the four faces of the other kind around it.
+  float fVelocity;
+  if (vDir.x != 0)
+  {
+    float fAcross = 0.25 * (WaterFaceV(vTexel) + WaterFaceV(vTexel + int2(1, 0)) + WaterFaceV(vTexel - int2(0, 1)) + WaterFaceV(vTexel + int2(1, -1)));
+    float2 vBack = vFacePos - float2(here.y, fAcross) * fDt * fInvTexel;
+    fVelocity = WaterSampleU(vBack);
+  }
+  else
+  {
+    float fAcross = 0.25 * (WaterFaceU(vTexel) + WaterFaceU(vTexel - int2(1, 0)) + WaterFaceU(vTexel + int2(0, 1)) + WaterFaceU(vTexel + int2(-1, 1)));
+    float2 vBack = vFacePos - float2(fAcross, here.z) * fDt * fInvTexel;
+    fVelocity = WaterSampleV(vBack);
+  }
+
+  // Gravity on the surface slope, plus the pressure head the sources press onto the surface.
+  float fPressureOther = FluidLoad(FluidAuxInput, vOther).y;
+  fVelocity -= SolverGravity * fDt * ((fEtaOther + fPressureOther) - (fEtaHere + fPressureHere)) * fInvTexel;
+
+  float fFaceDepth = max(0.5 * (fDepthHere + fDepthOther), SolverDryDepth);
+
+  // Wind stress pushes the water column, harder where it is shallow, in slow gusts so it raises uneven chop rather than
+  // a uniform tilt.
+  [branch]
+  if (SolverWind.x != 0.0 || SolverWind.y != 0.0)
+  {
+    float fWindAlong = vDir.x != 0 ? SolverWind.x : SolverWind.y;
+    // Gust cells are 4 m across and drift downwind at half the wind speed.
+    float2 vGustPos = (vFacePos * SolverTexelSize - SolverWind * (0.5 * SolverTime)) * 0.25;
+    float fGust = 0.5 + GustNoise(vGustPos);
+    fVelocity += fDt * FLUID_WATER_WIND_STRESS * length(SolverWind) * fWindAlong * fGust / max(fFaceDepth, 0.25);
+  }
+
+  // Manning friction of the bed, applied implicitly so it can never reverse the flow. It is what slows a sheet of water
+  // running up a beach; in deep water it is negligible.
+  float fFriction = SolverGravity * SolverFriction * SolverFriction * abs(fVelocity) / pow(fFaceDepth, 4.0 / 3.0);
+  fVelocity /= 1.0 + fDt * fFriction;
+
+  // Damping, extra damping in the swash zone (the last half metre of depth) and the Open sponge.
+  float fShallow = saturate(1.0 - fFaceDepth / 0.5);
+  float fSponge = max(WaterSponge(vTexel), WaterSponge(vOther));
+  fVelocity *= SolverDamping * exp(-(SolverShoreDamping * fShallow + 20.0 * fSponge) * fDt);
+
+  // Water only leaves a wet texel.
+  if (fVelocity > 0.0 && fDepthHere < SolverDryDepth)
+    return 0.0;
+  if (fVelocity < 0.0 && fDepthOther < SolverDryDepth)
+    return 0.0;
+
+  // A quarter texel per sub-step at most, so no texel can lose more water than it holds.
+  return clamp(fVelocity, -SolverMaxSpeed, SolverMaxSpeed);
+}
+
+[numthreads(FLUID_SOLVER_THREADS, FLUID_SOLVER_THREADS, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+  if (FluidOutOfGrid(id.xy))
+    return;
+
+  int2 vTexel = int2(id.xy);
+  float4 here = FluidStateInput.Load(int3(vTexel, 0));
+  float fBed = WaterBedAt(vTexel);
+  float fPressure = FluidAuxInput.Load(int3(vTexel, 0)).y;
+  bool bSolid = FluidIsSolid(FluidObstacleInput, vTexel);
+
+  float fU = UpdateFace(vTexel, int2(1, 0), here, fBed, fPressure, bSolid);
+  float fV = UpdateFace(vTexel, int2(0, 1), here, fBed, fPressure, bSolid);
+
+  FluidStateOutput[id.xy] = float4(here.x, fU, fV, here.w);
+}

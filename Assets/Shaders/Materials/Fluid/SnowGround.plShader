@@ -1,0 +1,189 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+BLEND_MODE
+RENDER_PASS
+PATH_TRACED_LIGHTING
+PROBE_DIRECT_LIGHTING
+PROBE_DIRECT_LIGHTING_SELECTED
+RESTIR_DIRECT_LIGHTING
+SHADING_MODE
+TWO_SIDED
+FLIP_WINDING
+FORWARD_PASS_WRITE_DEPTH
+MSAA
+CAMERA_MODE
+SHADING_QUALITY
+SHADOW_QUALITY
+VERTEX_SKINNING
+VERTEX_PREV_POSITION
+GAMEOBJECT_VELOCITY
+VELOCITY_OUTPUT
+BINDLESS_MATERIAL
+
+[MATERIALPARAMETER]
+
+Permutation BLEND_MODE;
+Permutation SHADING_MODE;
+Permutation TWO_SIDED;
+
+Color SnowColor @Default(Color(0.95, 0.96, 0.98)) @Group("Snow");
+Color CompressedColor @Default(Color(0.62, 0.68, 0.78)) @Group("Snow");
+float Roughness @Default(0.7) @Clamp(0.0, 1.0) @Group("Snow");
+float CompressedRoughness @Default(0.35) @Clamp(0.0, 1.0) @Group("Snow");
+float HeightScale @Default(1.0) @Group("Snow");
+float SparkleStrength @Default(0.0) @Clamp(0.0, 1.0) @Group("Snow");
+
+[MATERIALCONFIG]
+
+#include <Shaders/Materials/MaterialConfig.h>
+
+[RENDERSTATE]
+
+#include <Shaders/Materials/MaterialState.h>
+
+[MATERIALCONSTANTS]
+
+COLOR4F(SnowColor);
+COLOR4F(CompressedColor);
+FLOAT1(Roughness);
+FLOAT1(CompressedRoughness);
+FLOAT1(HeightScale);
+FLOAT1(SparkleStrength);
+
+[VERTEXSHADER]
+
+#define USE_NORMAL
+#define USE_TANGENT
+#define USE_TEXCOORD0
+#define USE_WORLD_POSITION_OFFSET
+
+#if GAMEOBJECT_VELOCITY
+  #define USE_VELOCITY
+#endif
+
+#if VERTEX_SKINNING
+  #define USE_SKINNING
+#endif
+
+#if RENDER_PASS == RENDER_PASS_EDITOR
+  #define USE_DEBUG_INTERPOLATOR
+#endif
+
+#include <Shaders/Materials/MaterialVertexShader.h>
+#include <Shaders/Fluid/FluidSample.h>
+
+// Raises the ground mesh by the Snow volume's depth (packed + loose) along the sampled normal. Outside every Snow
+// volume the mesh is left where it is.
+#if defined(USE_WORLD_POSITION_OFFSET)
+float3 GetWorldPositionOffset(plPerInstanceData data, float3 worldPosition)
+{
+  plFluidSample s = SampleFluidSnow(worldPosition);
+  return s.Valid ? s.Normal * (s.Height * GetMaterialData(HeightScale)) : float3(0, 0, 0);
+}
+#endif
+
+VS_OUT main(VS_IN Input)
+{
+  return FillVertexData(Input);
+}
+
+[PIXELSHADER]
+
+#define USE_NORMAL
+#define USE_TANGENT
+#define USE_TEXCOORD0
+#define USE_SIMPLE_MATERIAL_MODEL
+#define USE_MATERIAL_OCCLUSION
+#define USE_TWO_SIDED_LIGHTING
+#define USE_DECALS
+#define USE_FOG
+
+#if GAMEOBJECT_VELOCITY
+  #define USE_VELOCITY
+#endif
+
+#if RENDER_PASS == RENDER_PASS_EDITOR
+  #define USE_DEBUG_INTERPOLATOR
+#endif
+
+#include <Shaders/Materials/MaterialPixelShader.h>
+#include <Shaders/Fluid/FluidSample.h>
+
+// This material has no textures. BINDLESS_MATERIAL is still declared so the material states the variable explicitly
+// (permutation variables persist across draws); neither value changes what this shader does.
+
+// One fluid sample per pixel, taken on first use so every entry point (forward, gbuffer, depth) shares it.
+static bool g_SnowSampled = false;
+static plFluidSample g_Snow;
+
+plFluidSample GetSnow()
+{
+  if (!g_SnowSampled)
+  {
+    g_Snow = SampleFluidSnow(G.Input.WorldPosition.xyz);
+    g_SnowSampled = true;
+  }
+  return g_Snow;
+}
+
+// Compression of the snow under this pixel, 0 = untouched, 1 = fully packed.
+float GetCompression()
+{
+  plFluidSample s = GetSnow();
+  return s.Valid ? saturate(s.Wetness) : 0.0;
+}
+
+// Sparse per-texel glints from a world-position hash; SparkleStrength 0 disables them.
+float GetSparkle()
+{
+  float strength = GetMaterialData(SparkleStrength);
+  if (strength <= 0.0)
+    return 0.0;
+
+  float3 cell = floor(G.Input.WorldPosition.xyz * 60.0);
+  float h = frac(sin(dot(cell, float3(12.9898, 78.233, 37.719))) * 43758.5453);
+  float3 viewDir = normalize(GetCameraPosition() - G.Input.WorldPosition.xyz);
+  float facing = saturate(dot(normalize(G.Input.Normal), viewDir));
+  return strength * step(0.985, h) * facing;
+}
+
+float3 GetNormal()
+{
+  plFluidSample s = GetSnow();
+  return s.Valid ? s.Normal : normalize(G.Input.Normal);
+}
+
+float3 GetBaseColor()
+{
+  float3 color = lerp(GetMaterialData(SnowColor).rgb, GetMaterialData(CompressedColor).rgb, GetCompression());
+  return color * GetInstanceData().Color.rgb;
+}
+
+float GetMetallic()
+{
+  return 0.0;
+}
+
+float GetReflectance()
+{
+  return 0.5;
+}
+
+float GetRoughness()
+{
+  float roughness = lerp(GetMaterialData(Roughness), GetMaterialData(CompressedRoughness), GetCompression());
+  return saturate(roughness - GetSparkle() * 0.6);
+}
+
+float GetOpacity()
+{
+  return GetMaterialData(SnowColor).a * GetInstanceData().Color.a;
+}
+
+float GetOcclusion()
+{
+  return 1.0 - 0.3 * GetCompression();
+}

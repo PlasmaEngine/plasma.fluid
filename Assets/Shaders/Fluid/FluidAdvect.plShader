@@ -1,0 +1,67 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+[COMPUTESHADER]
+
+#include <Shaders/Common/Common.h>
+#include <Shaders/Fluid/FluidCommon.h>
+
+// Semi-Lagrangian advection of the whole packed state (velocity, density, temperature) in one pass, with an optional
+// MacCormack correction. Advecting density with the pre-projection velocity costs a little accuracy and saves a
+// second advection plus a second projection, which is the usual trade in a real-time solver.
+
+Texture2D<float4> FluidStateInput BIND_GROUP(BG_DRAW_CALL);
+Texture2D<float4> FluidObstacleInput BIND_GROUP(BG_DRAW_CALL);
+RWTexture2D<float4> FluidStateOutput BIND_GROUP(BG_DRAW_CALL);
+
+// Velocity is stored in m/s; one step moves it SolverStepTime seconds, converted to texels.
+float2 FluidVelocityToTexels(float2 vVelocity)
+{
+  return vVelocity * (SolverStepTime / max(SolverTexelSize, 1e-6));
+}
+
+[numthreads(FLUID_SOLVER_THREADS, FLUID_SOLVER_THREADS, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+  if (FluidOutOfGrid(id.xy))
+    return;
+
+  if (FluidIsSolid(FluidObstacleInput, int2(id.xy)))
+  {
+    FluidStateOutput[id.xy] = float4(0, 0, 0, 0);
+    return;
+  }
+
+  float2 vTexelPos = float2(id.xy) + 0.5;
+  float4 here = FluidStateInput.Load(int3(id.xy, 0));
+
+  float2 vBack = vTexelPos - FluidVelocityToTexels(here.xy);
+  float4 advected = FluidSampleBilinear(FluidStateInput, vBack);
+
+  [branch]
+  if ((SolverFlags & FLUID_FLAG_MACCORMACK) != 0)
+  {
+    // Re-advect forward from the back-traced point and correct by the round-trip error, then clamp to the
+    // neighbourhood the backward trace read so the correction cannot overshoot into new extrema.
+    float2 vForward = vBack + FluidVelocityToTexels(advected.xy);
+    float4 roundTrip = FluidSampleBilinear(FluidStateInput, vForward);
+    float4 corrected = advected + 0.5 * (here - roundTrip);
+
+    int2 i0 = int2(floor(vBack - 0.5));
+    float4 s00 = FluidLoad(FluidStateInput, i0);
+    float4 s10 = FluidLoad(FluidStateInput, i0 + int2(1, 0));
+    float4 s01 = FluidLoad(FluidStateInput, i0 + int2(0, 1));
+    float4 s11 = FluidLoad(FluidStateInput, i0 + int2(1, 1));
+    float4 vMin = min(min(s00, s10), min(s01, s11));
+    float4 vMax = max(max(s00, s10), max(s01, s11));
+
+    advected = clamp(corrected, vMin, vMax);
+  }
+
+  advected.xy *= SolverVelocityDissipation;
+  advected.zw *= SolverDensityDissipation;
+
+  FluidStateOutput[id.xy] = advected;
+}

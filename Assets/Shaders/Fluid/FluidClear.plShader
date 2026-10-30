@@ -1,0 +1,24 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+[COMPUTESHADER]
+
+#include <Shaders/Common/Common.h>
+#include <Shaders/Fluid/FluidCommon.h>
+
+// Fills a freshly created state texture with the volume's starting state. Runs once per texture, when a volume is
+// created or changes resolution or mode; the other solver textures are fully rewritten every frame and never need it.
+// Snow starts at its Initial Depth so a volume has something to trample before any snow has fallen.
+
+RWTexture2D<float4> FluidClearTarget BIND_GROUP(BG_DRAW_CALL);
+
+[numthreads(FLUID_SOLVER_THREADS, FLUID_SOLVER_THREADS, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+  if (FluidOutOfGrid(id.xy))
+    return;
+
+  FluidClearTarget[id.xy] = SolverInitialState;
+}

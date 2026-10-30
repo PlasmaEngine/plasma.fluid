@@ -1,0 +1,75 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+[COMPUTESHADER]
+
+#include <Shaders/Common/Common.h>
+#include <Shaders/Fluid/FluidCommon.h>
+
+// Rasterises the volume's colliders and, for Gas and Snow with a baked bed, its land into the obstacle mask. Rebuilt
+// whenever a dynamic collider moved or the bed changed; a volume with only static colliders keeps the mask it was given.
+
+StructuredBuffer<plFluidColliderGpu> FluidColliders BIND_GROUP(BG_DRAW_CALL);
+Texture2D<float4> FluidBedInput BIND_GROUP(BG_DRAW_CALL); // R: bed height relative to the water surface, metres; >= 0 is land
+RWTexture2D<float> FluidObstacleOutput BIND_GROUP(BG_DRAW_CALL);
+
+float ColliderCoverage(plFluidColliderGpu col, float2 vTexelPos)
+{
+  float2 vDelta = vTexelPos - col.Position;
+
+  float fCos = cos(-col.Rotation);
+  float fSin = sin(-col.Rotation);
+  float2 vLocal = float2(vDelta.x * fCos - vDelta.y * fSin, vDelta.x * fSin + vDelta.y * fCos);
+
+  uint uiShape = (uint)col.Shape;
+
+  if (uiShape == FLUID_COLLIDER_BOX)
+  {
+    float2 vExtents = max(col.Extents, 0.5);
+    return all(abs(vLocal) <= vExtents) ? 1.0 : 0.0;
+  }
+
+  if (uiShape == FLUID_COLLIDER_CAPSULE)
+  {
+    float fHalfLength = max(col.Extents.x, 0.0);
+    float fRadius = max(col.Extents.y, 0.5);
+    float fAlong = clamp(vLocal.x, -fHalfLength, fHalfLength);
+    return length(vLocal - float2(fAlong, 0.0)) <= fRadius ? 1.0 : 0.0;
+  }
+
+  return length(vLocal) <= max(col.Extents.x, 0.5) ? 1.0 : 0.0;
+}
+
+[numthreads(FLUID_SOLVER_THREADS, FLUID_SOLVER_THREADS, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+  if (FluidOutOfGrid(id.xy))
+    return;
+
+  float2 vTexelPos = float2(id.xy) + 0.5;
+  float fSolid = 0.0;
+
+  for (uint i = 0; i < SolverNumColliders; ++i)
+  {
+    fSolid = max(fSolid, ColliderCoverage(FluidColliders[i], vTexelPos));
+  }
+
+  // Land is solid for Gas and Snow. Water floods and drains the bed instead, so for it only colliders are solid.
+  if (SolverHasBed != 0 && SolverMode != FLUID_MODE_WATER)
+  {
+    float fBed = FluidBedInput.SampleLevel(LinearClampSampler, FluidTexelToUv(vTexelPos), 0).x;
+    if (fBed >= 0.0)
+      fSolid = 1.0;
+  }
+
+  // A closed volume walls itself in, so fluid cannot leave through the border.
+  if (SolverBoundary == FLUID_BOUNDARY_CLOSED)
+  {
+    if (id.x == 0 || id.y == 0 || id.x + 1 == SolverRes.x || id.y + 1 == SolverRes.y)
+      fSolid = 1.0;
+  }
+
+  FluidObstacleOutput[id.xy] = fSolid;
+}

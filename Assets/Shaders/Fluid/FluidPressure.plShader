@@ -1,0 +1,51 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+[COMPUTESHADER]
+
+#include <Shaders/Common/Common.h>
+#include <Shaders/Fluid/FluidCommon.h>
+
+// One Jacobi iteration of the pressure Poisson equation. Run this repeatedly, ping-ponging the two pressure
+// textures; the iteration count is the solver's dominant cost and its main quality lever.
+//
+// A solid neighbour uses this texel's own pressure, the pure Neumann condition that makes the projection leave no
+// flow through the wall.
+
+Texture2D<float4> FluidPressureInput BIND_GROUP(BG_DRAW_CALL);
+Texture2D<float4> FluidDivergenceInput BIND_GROUP(BG_DRAW_CALL);
+Texture2D<float4> FluidObstacleInput BIND_GROUP(BG_DRAW_CALL);
+RWTexture2D<float> FluidPressureOutput BIND_GROUP(BG_DRAW_CALL);
+
+float PressureAt(int2 vTexel, float fCentre)
+{
+  if (FluidIsSolid(FluidObstacleInput, vTexel))
+    return fCentre;
+
+  return FluidLoadR(FluidPressureInput, vTexel);
+}
+
+[numthreads(FLUID_SOLVER_THREADS, FLUID_SOLVER_THREADS, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+  if (FluidOutOfGrid(id.xy))
+    return;
+
+  int2 vTexel = int2(id.xy);
+
+  if (FluidIsSolid(FluidObstacleInput, vTexel))
+  {
+    FluidPressureOutput[id.xy] = 0.0;
+    return;
+  }
+
+  float fCentre = FluidLoadR(FluidPressureInput, vTexel);
+  float fDivergence = FluidLoadR(FluidDivergenceInput, vTexel);
+
+  float fSum = PressureAt(vTexel + int2(1, 0), fCentre) + PressureAt(vTexel - int2(1, 0), fCentre) +
+               PressureAt(vTexel + int2(0, 1), fCentre) + PressureAt(vTexel - int2(0, 1), fCentre);
+
+  FluidPressureOutput[id.xy] = (fSum - fDivergence) * 0.25;
+}

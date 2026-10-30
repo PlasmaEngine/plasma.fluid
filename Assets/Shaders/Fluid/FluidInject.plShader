@@ -1,0 +1,122 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+[COMPUTESHADER]
+
+#include <Shaders/Common/Common.h>
+#include <Shaders/Fluid/FluidSources.h>
+
+// Adds every emitter, touch source and scripted impulse into the state of a Gas or Snow volume. What a source
+// contributes depends on the mode: density, temperature and velocity for Gas, a press for Snow. A Vortex source (Gas)
+// does not add velocity; it pulls the flow around it onto a swirl profile. Water has its own FluidWaterInject.
+
+Texture2D<float4> FluidStateInput BIND_GROUP(BG_DRAW_CALL);
+Texture2D<float4> FluidObstacleInput BIND_GROUP(BG_DRAW_CALL);
+RWTexture2D<float4> FluidStateOutput BIND_GROUP(BG_DRAW_CALL);
+
+// Relaxes the velocity toward a Rankine vortex around the source: tangential speed Swirl at the core edge and inflow
+// Drain, both rising linearly inside the core and falling off as 1/r outside. Relaxing toward a fixed target bounds
+// the speed by the target itself, however long the source stays. Density and temperature are added inside the core;
+// density inside the core drains away at the rate the inflow crosses the core, so smoke spirals in and vanishes.
+void InjectVortex(plFluidSourceGpu src, float2 vTexelPos, float fStep, inout float4 state)
+{
+  float fRadius = max(src.Radius, 1.0);
+  float2 vDelta = vTexelPos - src.Position;
+  float fDist = length(vDelta);
+  float fReach = FluidVortexReach(fDist, fRadius) * saturate(1.0 - src.HeightFade);
+  if (fReach <= 0.0)
+    return;
+
+  float fDrain = max(src.Drain, 0.0);
+  float2 vRadial = vDelta / max(fDist, 1e-3);
+  float2 vTangent = float2(-vRadial.y, vRadial.x); // counter-clockwise seen from +Z
+  float2 vTarget = (vTangent * src.Swirl - vRadial * fDrain) * FluidVortexShape(fDist, fRadius);
+
+  // 6 per second: the flow settles onto the profile within a few frames without snapping to it in one.
+  state.xy = lerp(state.xy, vTarget, saturate(6.0 * fStep) * fReach);
+
+  float fCore = FluidVortexCore(fDist, fRadius) * saturate(1.0 - src.HeightFade);
+  state.z += src.Density * fCore * fStep;
+  state.w += src.Temperature * fCore * fStep;
+
+  float fCoreMetres = fRadius * SolverTexelSize;
+  state.z *= exp(-fCore * fDrain * fStep / max(fCoreMetres, 1e-3));
+}
+
+[numthreads(FLUID_SOLVER_THREADS, FLUID_SOLVER_THREADS, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+  if (FluidOutOfGrid(id.xy))
+    return;
+
+  float4 state = FluidStateInput.Load(int3(id.xy, 0));
+
+  if (FluidIsSolid(FluidObstacleInput, int2(id.xy)))
+  {
+    // Solid texels hold no fluid. Snow keeps its depth so a wall does not erase the drift against it.
+    if (SolverMode != FLUID_MODE_SNOW)
+      state = float4(0, 0, 0, 0);
+
+    FluidStateOutput[id.xy] = state;
+    return;
+  }
+
+  float2 vTexelPos = float2(id.xy) + 0.5;
+  float fStep = SolverStepTime;
+
+  // Snow's disturbance signal fades every step before this step's presses add to it, so a disturbance reads as a
+  // burst that dies away rather than a level that stays. Tiny remainders are flushed so the spray fully stops.
+  if (SolverMode == FLUID_MODE_SNOW)
+  {
+    state.w *= SolverDisturbanceDecay;
+    if (state.w < 1e-4)
+      state.w = 0.0;
+  }
+
+  uint2 vRange = FluidSourceRange(id.xy);
+  for (uint i = 0; i < vRange.y; ++i)
+  {
+    plFluidSourceGpu src = FluidSources[FluidSourceIndices[vRange.x + i]];
+
+    if ((uint)src.Shape == FLUID_SOURCE_VORTEX)
+    {
+      if (SolverMode == FLUID_MODE_GAS)
+        InjectVortex(src, vTexelPos, fStep, state);
+      continue;
+    }
+
+    float fWeight = FluidSourceWeight(src, vTexelPos) * saturate(1.0 - src.HeightFade);
+    if (fWeight <= 0.0)
+      continue;
+
+    if (SolverMode == FLUID_MODE_GAS)
+    {
+      // A moving source drags the gas it covers toward its own velocity, at 10 per second, so the gas there can never
+      // run faster than the source does. A still source leaves velocity alone: a smoke emitter must not brake the
+      // plume rising out of it.
+      if (dot(src.Velocity, src.Velocity) > 1e-6)
+        state.xy = lerp(state.xy, src.Velocity, saturate(10.0 * fStep) * fWeight);
+      state.z += src.Density * fWeight * fStep;
+      state.w += src.Temperature * fWeight * fStep;
+    }
+    else // Snow
+    {
+      // A press sinks the packed snow and marks it compressed. Only snow that is not yet compressed gives way, so a
+      // foot or a body resting in place sinks once and then stops; walking keeps meeting fresh snow. The snow it
+      // displaces does not vanish: Ridge decides how much is thrown up as loose snow, which slumps down the walls of
+      // the print and blows away, and the same amount feeds the disturbance signal that drives the spray.
+      float fPress = src.Press * fWeight;
+      float fSink = state.x * SolverCompression * fPress * (1.0 - state.y);
+      float fKicked = fSink * SolverRidge;
+
+      state.x = max(state.x - fSink, 0.0);
+      state.y = saturate(state.y + fPress);
+      state.z += fKicked;
+      state.w += fKicked;
+    }
+  }
+
+  FluidStateOutput[id.xy] = state;
+}

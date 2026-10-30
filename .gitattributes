@@ -1,0 +1,18 @@
+# Normalised to LF in the repository, checked out native. A package is built on Windows today and
+# on Linux eventually, and neither should see the other's line endings as a diff.
+* text=auto
+
+# Windows tooling reads these; CRLF keeps them runnable straight out of a checkout.
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Content and binaries, which line-ending conversion would corrupt.
+*.dds binary
+*.png binary
+*.jpg binary
+*.tga binary
+*.dll binary
+*.lib binary
+*.pdb binary
+*.plpkg binary

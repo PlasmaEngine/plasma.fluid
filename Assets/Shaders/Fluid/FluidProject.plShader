@@ -1,0 +1,65 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+[COMPUTESHADER]
+
+#include <Shaders/Common/Common.h>
+#include <Shaders/Fluid/FluidCommon.h>
+
+// Subtracts the pressure gradient, which makes the velocity field divergence free. This is the step that turns a
+// spreading blob into a swirling one.
+
+Texture2D<float4> FluidStateInput BIND_GROUP(BG_DRAW_CALL);
+Texture2D<float4> FluidPressureInput BIND_GROUP(BG_DRAW_CALL);
+Texture2D<float4> FluidObstacleInput BIND_GROUP(BG_DRAW_CALL);
+RWTexture2D<float4> FluidStateOutput BIND_GROUP(BG_DRAW_CALL);
+
+[numthreads(FLUID_SOLVER_THREADS, FLUID_SOLVER_THREADS, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+  if (FluidOutOfGrid(id.xy))
+    return;
+
+  int2 vTexel = int2(id.xy);
+  float4 state = FluidStateInput.Load(int3(vTexel, 0));
+
+  if (FluidIsSolid(FluidObstacleInput, vTexel))
+  {
+    FluidStateOutput[id.xy] = float4(0, 0, 0, 0);
+    return;
+  }
+
+  float fCentre = FluidLoadR(FluidPressureInput, vTexel);
+
+  bool bSolidRight = FluidIsSolid(FluidObstacleInput, vTexel + int2(1, 0));
+  bool bSolidLeft = FluidIsSolid(FluidObstacleInput, vTexel - int2(1, 0));
+  bool bSolidUp = FluidIsSolid(FluidObstacleInput, vTexel + int2(0, 1));
+  bool bSolidDown = FluidIsSolid(FluidObstacleInput, vTexel - int2(0, 1));
+
+  float fRight = bSolidRight ? fCentre : FluidLoadR(FluidPressureInput, vTexel + int2(1, 0));
+  float fLeft = bSolidLeft ? fCentre : FluidLoadR(FluidPressureInput, vTexel - int2(1, 0));
+  float fUp = bSolidUp ? fCentre : FluidLoadR(FluidPressureInput, vTexel + int2(0, 1));
+  float fDown = bSolidDown ? fCentre : FluidLoadR(FluidPressureInput, vTexel - int2(0, 1));
+
+  state.xy -= 0.5 * float2(fRight - fLeft, fUp - fDown);
+
+  // No flow into a wall. The tangential component survives, so every collider is free-slip; plFluidColliderGpu
+  // carries a Slip value that no kernel reads yet.
+  if (bSolidRight) state.x = min(state.x, 0.0);
+  if (bSolidLeft) state.x = max(state.x, 0.0);
+  if (bSolidUp) state.y = min(state.y, 0.0);
+  if (bSolidDown) state.y = max(state.y, 0.0);
+
+  // An open boundary lets fluid leave; a closed one is already walled off by the obstacle pass.
+  if (SolverBoundary == FLUID_BOUNDARY_OPEN)
+  {
+    if (id.x == 0) state.x = min(state.x, 0.0);
+    if (id.y == 0) state.y = min(state.y, 0.0);
+    if (id.x + 1 == SolverRes.x) state.x = max(state.x, 0.0);
+    if (id.y + 1 == SolverRes.y) state.y = max(state.y, 0.0);
+  }
+
+  FluidStateOutput[id.xy] = state;
+}

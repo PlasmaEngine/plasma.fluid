@@ -1,0 +1,26 @@
+# Build output. A package repository holds source and content; binaries come from a build, and
+# from the release workflow for anyone who has no toolchain.
+Bin/
+Intermediate/
+obj/
+
+# Project files, which plasmabuild generates on demand from the workspace. Checking them in only
+# creates something that can disagree with it.
+.vs/
+.vscode/
+*.sln
+*.slnx
+*.vcxproj
+*.vcxproj.*
+*.code-workspace
+/CMakeLists.txt
+*.user
+*.suo
+
+# What the packaging step produces. Releases carry these; the repository does not.
+*.plpkg
+*.plpkg.sha256
+
+# Regenerated at publish time by PackageInspector --write-checksums
+_blobs/
+Package.sha256

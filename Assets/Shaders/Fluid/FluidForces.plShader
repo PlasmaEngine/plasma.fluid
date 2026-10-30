@@ -1,0 +1,81 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+[COMPUTESHADER]
+
+#include <Shaders/Common/Common.h>
+#include <Shaders/Fluid/FluidCommon.h>
+
+// Body forces for Gas: buoyancy from temperature, the scene's wind, vorticity confinement and viscosity. Vorticity
+// confinement re-adds the small swirls the grid loses to numerical diffusion, which is what keeps smoke from turning
+// into a smooth blob.
+
+Texture2D<float4> FluidStateInput BIND_GROUP(BG_DRAW_CALL);
+Texture2D<float4> FluidObstacleInput BIND_GROUP(BG_DRAW_CALL);
+RWTexture2D<float4> FluidStateOutput BIND_GROUP(BG_DRAW_CALL);
+
+float FluidCurl(int2 vTexel)
+{
+  float2 vRight = FluidLoad(FluidStateInput, vTexel + int2(1, 0)).xy;
+  float2 vLeft = FluidLoad(FluidStateInput, vTexel - int2(1, 0)).xy;
+  float2 vUp = FluidLoad(FluidStateInput, vTexel + int2(0, 1)).xy;
+  float2 vDown = FluidLoad(FluidStateInput, vTexel - int2(0, 1)).xy;
+
+  return 0.5 * ((vRight.y - vLeft.y) - (vUp.x - vDown.x));
+}
+
+[numthreads(FLUID_SOLVER_THREADS, FLUID_SOLVER_THREADS, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+  if (FluidOutOfGrid(id.xy))
+    return;
+
+  int2 vTexel = int2(id.xy);
+
+  if (FluidIsSolid(FluidObstacleInput, vTexel))
+  {
+    FluidStateOutput[id.xy] = float4(0, 0, 0, 0);
+    return;
+  }
+
+  float4 state = FluidStateInput.Load(int3(vTexel, 0));
+  float fStep = SolverStepTime;
+
+  // Buoyancy lifts hot, dense smoke along the volume's local +Y and density weighs it back down.
+  float fTemperature = state.w - SolverAmbientTemperature;
+  state.y += (SolverBuoyancy * fTemperature - 0.1 * state.z) * fStep;
+
+  state.xy += SolverWind * fStep;
+
+  [branch]
+  if (SolverVorticity > 0.0)
+  {
+    float fCurl = FluidCurl(vTexel);
+    float fRight = abs(FluidCurl(vTexel + int2(1, 0)));
+    float fLeft = abs(FluidCurl(vTexel - int2(1, 0)));
+    float fUp = abs(FluidCurl(vTexel + int2(0, 1)));
+    float fDown = abs(FluidCurl(vTexel - int2(0, 1)));
+
+    float2 vGradient = float2(fRight - fLeft, fUp - fDown) * 0.5;
+    float fLength = length(vGradient);
+    if (fLength > 1e-5)
+    {
+      float2 vN = vGradient / fLength;
+      // Force perpendicular to the vorticity gradient, scaled by the local curl.
+      state.xy += float2(vN.y, -vN.x) * (fCurl * SolverVorticity * SolverTexelSize) * fStep;
+    }
+  }
+
+  [branch]
+  if (SolverViscosity > 0.0)
+  {
+    float2 vSum = FluidLoad(FluidStateInput, vTexel + int2(1, 0)).xy + FluidLoad(FluidStateInput, vTexel - int2(1, 0)).xy +
+                  FluidLoad(FluidStateInput, vTexel + int2(0, 1)).xy + FluidLoad(FluidStateInput, vTexel - int2(0, 1)).xy;
+    float2 vLaplacian = vSum - 4.0 * state.xy;
+    state.xy += vLaplacian * saturate(SolverViscosity * fStep);
+  }
+
+  FluidStateOutput[id.xy] = state;
+}

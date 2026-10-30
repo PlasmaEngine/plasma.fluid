@@ -1,0 +1,120 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+[COMPUTESHADER]
+
+#include <Shaders/Common/Common.h>
+#include <Shaders/Fluid/FluidCommon.h>
+
+// Copies one volume's finished state into the shared atlas, in the layout Shaders/Fluid/FluidSample.h reads. This is
+// the only pass consumers depend on, so the solver's internal packing can change without touching any material.
+
+Texture2D<float4> FluidStateInput BIND_GROUP(BG_DRAW_CALL);
+Texture2D<float4> FluidAuxInput BIND_GROUP(BG_DRAW_CALL); // Water: x wet map. Other modes bind a 1x1 placeholder and never read it
+Texture2D<float4> FluidBedInput BIND_GROUP(BG_DRAW_CALL); // Water: the ground, see FluidSolverConstants.h
+RWTexture2D<float2> FluidAtlasVelocityOutput BIND_GROUP(BG_DRAW_CALL);
+RWTexture2D<float4> FluidAtlasDensityOutput BIND_GROUP(BG_DRAW_CALL);
+RWTexture2D<float4> FluidAtlasSurfaceOutput BIND_GROUP(BG_DRAW_CALL);
+
+// Metres a dry texel's published surface sits below the ground, so a water mesh displaced by it hides under the beach.
+#define FLUID_WATER_DRY_TUCK 0.05
+
+float WaterBedAt(int2 vTexel)
+{
+  if (SolverHasBed == 0)
+    return -SolverOpenDepth;
+
+  float2 uv = FluidTexelToUv(float2(FluidWrapTexel(vTexel)) + 0.5);
+  return max(FluidBedInput.SampleLevel(LinearClampSampler, uv, 0).x, -SolverOpenDepth);
+}
+
+// The surface a Water texel publishes: the water where it is wet, just under the ground where it is dry.
+float WaterPublishedHeight(int2 vTexel)
+{
+  vTexel = FluidWrapTexel(vTexel);
+  float fBed = WaterBedAt(vTexel);
+  float fEta = max(FluidStateInput.Load(int3(vTexel, 0)).x, fBed);
+  return (fEta - fBed) >= SolverDryDepth ? fEta : fBed - FLUID_WATER_DRY_TUCK;
+}
+
+float SurfaceHeightAt(int2 vTexel)
+{
+  if (SolverMode == FLUID_MODE_WATER)
+    return WaterPublishedHeight(vTexel);
+
+  // Snow: packed plus loose is the surface a consumer sees.
+  float4 s = FluidLoad(FluidStateInput, vTexel);
+  return s.x + s.z;
+}
+
+[numthreads(FLUID_SOLVER_THREADS, FLUID_SOLVER_THREADS, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+  if (FluidOutOfGrid(id.xy))
+    return;
+
+  int2 vTexel = int2(id.xy);
+  uint2 vOut = SolverAtlasOffset + id.xy;
+
+  float4 state = FluidStateInput.Load(int3(vTexel, 0));
+
+  float2 vVelocity = float2(0, 0);
+  float4 vDensity = float4(0, 0, 0, 0);
+  float fHeight = 0.0;
+  float fExtra = 0.0;
+
+  if (SolverMode == FLUID_MODE_GAS)
+  {
+    vVelocity = state.xy;
+    vDensity.xy = state.zw;
+  }
+  else if (SolverMode == FLUID_MODE_WATER)
+  {
+    // Face velocities averaged to the texel centre. Border faces of a wall-bounded volume are walls.
+    bool bWrap = SolverBoundary == FLUID_BOUNDARY_WRAP;
+    float fULeft = (vTexel.x > 0 || bWrap) ? FluidLoad(FluidStateInput, vTexel - int2(1, 0)).y : 0.0;
+    float fVDown = (vTexel.y > 0 || bWrap) ? FluidLoad(FluidStateInput, vTexel - int2(0, 1)).z : 0.0;
+    vVelocity = 0.5 * float2(fULeft + state.y, fVDown + state.z);
+
+    float fBed = WaterBedAt(vTexel);
+    float fDepth = max(state.x - fBed, 0.0);
+
+    fHeight = WaterPublishedHeight(vTexel);
+    fExtra = state.w; // foam
+    vDensity.z = FluidAuxInput.Load(int3(vTexel, 0)).x; // wet map
+    vDensity.w = fDepth >= SolverDryDepth ? fDepth : 0.0;
+  }
+  else // Snow
+  {
+    fHeight = state.x + state.z;
+    fExtra = state.y;    // compression
+    vDensity.xy = state.zw; // loose depth, disturbance
+  }
+
+  // Surface normal from the height gradient, in plane-local space. Only the xy components are stored; the consumer
+  // rebuilds z, which is always positive because the surface is a height field.
+  float2 vNormalXY = float2(0, 0);
+  if (SolverMode != FLUID_MODE_GAS)
+  {
+    float fRight = SurfaceHeightAt(vTexel + int2(1, 0));
+    float fLeft = SurfaceHeightAt(vTexel - int2(1, 0));
+    float fUp = SurfaceHeightAt(vTexel + int2(0, 1));
+    float fDown = SurfaceHeightAt(vTexel - int2(0, 1));
+
+    float3 vNormal = normalize(float3(-(fRight - fLeft), -(fUp - fDown), 2.0 * max(SolverTexelSize, 1e-6)));
+    vNormalXY = vNormal.xy;
+
+    // Water: the Laplacian of the surface, 1/m. Negative on crests and ridges, positive in troughs.
+    if (SolverMode == FLUID_MODE_WATER)
+    {
+      float fTexel = max(SolverTexelSize, 1e-6);
+      vDensity.x = (fRight + fLeft + fUp + fDown - 4.0 * fHeight) / (fTexel * fTexel);
+    }
+  }
+
+  FluidAtlasVelocityOutput[vOut] = vVelocity;
+  FluidAtlasDensityOutput[vOut] = vDensity;
+  FluidAtlasSurfaceOutput[vOut] = float4(fHeight, vNormalXY, fExtra);
+}

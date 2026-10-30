@@ -1,0 +1,62 @@
+[PLATFORMS]
+ALL
+
+[PERMUTATIONS]
+
+[COMPUTESHADER]
+
+#include <Shaders/Common/Common.h>
+#include <Shaders/Fluid/FluidCommon.h>
+
+// Reduces a Snow or Water volume's state into a 16x16 activity grid the CPU reads back. One group of 16x16 threads:
+// each thread reduces its block of the grid. Resolutions are powers of two of at least 64, so the blocks tile the grid
+// exactly.
+//   Snow:  x = the disturbance (state .w, metres of snow recently kicked up by a press), summed
+//   Water: x = lowest surface, y = highest surface (metres above the plane), z = fastest face velocity (m/s), w = texels
+//          holding a NaN or an infinity, which must stay 0
+
+Texture2D<float4> FluidStateInput BIND_GROUP(BG_DRAW_CALL);
+RWTexture2D<float4> FluidActivityOutput BIND_GROUP(BG_DRAW_CALL);
+
+[numthreads(16, 16, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+  uint2 vBlock = max(SolverRes / 16, uint2(1, 1));
+  uint2 vStart = id.xy * vBlock;
+
+  float4 result = SolverMode == FLUID_MODE_WATER ? float4(1e6, -1e6, 0, 0) : float4(0, 0, 0, 0);
+
+  [loop]
+  for (uint y = 0; y < vBlock.y; ++y)
+  {
+    [loop]
+    for (uint x = 0; x < vBlock.x; ++x)
+    {
+      uint2 vTexel = vStart + uint2(x, y);
+      if (FluidOutOfGrid(vTexel))
+        continue;
+
+      float4 state = FluidStateInput.Load(int3(vTexel, 0));
+
+      if (SolverMode == FLUID_MODE_WATER)
+      {
+        if (any(isnan(state)) || any(isinf(state)))
+        {
+          result.w += 1.0;
+          continue;
+        }
+
+        float fSurface = max(state.x, -SolverOpenDepth);
+        result.x = min(result.x, fSurface);
+        result.y = max(result.y, fSurface);
+        result.z = max(result.z, max(abs(state.y), abs(state.z)));
+      }
+      else
+      {
+        result.x += state.w;
+      }
+    }
+  }
+
+  FluidActivityOutput[id.xy] = result;
+}
