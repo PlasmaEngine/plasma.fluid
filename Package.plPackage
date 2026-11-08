@@ -9,14 +9,14 @@
 PackageInfo
 {
 	string %Id{"plasma.fluid"}
-	string %Version{"0.3.2"}
+	string %Version{"0.4.0"}
 	string %Publisher{"PlasmaTechnology"}
 	string %License{"MIT"}
 	string %Homepage{"https://plasmagameengine.com"}
 
-	string %MinEngineVersion{"0.11.2"}
-	string %MaxEngineVersion{"0.11.2"}
-	string %AbiTag{"win64-msvc19-0.11.2-abi6-dev"}
+	string %MinEngineVersion{"0.12.0"}
+	string %MaxEngineVersion{"0.12.0"}
+	string %AbiTag{"win64-msvc19-0.12.0-abi7-dev"}
 
 	string %DisplayName{"Fluid"}
 	string %Category{"Rendering"}
@@ -44,4 +44,6 @@ PackageInfo
 	Component { string %Name{"icon"} string %Platform{"any"} }
 	Component { string %Name{"banner"} string %Platform{"any"} }
 	Component { string %Name{"runtime-win64"} string %Platform{"win64"} }
+	Component { string %Name{"runtime-linux64"} string %Platform{"linux64"} string %AbiTag{"linux64-clang18-0.12.0-abi7-dev"} }
+	Component { string %Name{"runtime-macos64"} string %Platform{"macos64"} string %AbiTag{"macosarm64-clang17-0.12.0-abi7-dev"} }
 }

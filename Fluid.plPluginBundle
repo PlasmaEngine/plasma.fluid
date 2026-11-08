@@ -5,8 +5,8 @@ PluginInfo
 {
 	string %DisplayName{"Fluid"}
 	string %Category{"Rendering"}
-	string %MinEngineVersion{"0.11.2"}
-	string %MaxEngineVersion{"0.11.2"}
+	string %MinEngineVersion{"0.12.0"}
+	string %MaxEngineVersion{"0.12.0"}
 	string %Description{"Fluid Volumes: GPU smoke, shallow water and snow fields sampled by materials and particles."}
 	string %EditorPlugins{}
 	string %EditorEnginePlugins{}
