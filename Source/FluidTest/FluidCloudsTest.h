@@ -87,10 +87,10 @@ private:
     float m_fFlowPeriod = 25.0f; ///< fluid seconds per cycle of the clouds' flow-mapped noise
   };
 
-  void AddSunAndSky(float fLux);
+  void AddSunAndSky(float fLux, bool bShadows);
   void SetSun(float fElevationDegrees, float fAzimuthDegrees);
   void SetCamera(const plVec3& vPos, const plVec3& vTarget, float fFovY);
-  plGameObject* AddBox(const char* szName, const plVec3& vCenter, const plVec3& vSize, const plColor& color, bool bFullbright = false);
+  plGameObject* AddBox(const char* szName, const plVec3& vCenter, const plVec3& vSize, const plColor& color, bool bFullbright = false, bool bCastShadow = true);
   plVolumetricCloudsComponent* AddClouds(const WeatherSetup& weather);
   void AddWeather(const WeatherSetup& weather);
   plFluidEmitterComponent* AddEmitter(const char* szName, const plVec2& vPos);

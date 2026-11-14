@@ -56,7 +56,7 @@ PL_BEGIN_STATIC_REFLECTED_ENUM(plFluidDebugView, 1)
   PL_ENUM_CONSTANT(plFluidDebugView::Obstacles),
 PL_END_STATIC_REFLECTED_ENUM;
 
-PL_BEGIN_STATIC_REFLECTED_TYPE(plFluidSettings, plNoBase, 2, plRTTIDefaultAllocator<plFluidSettings>)
+PL_BEGIN_STATIC_REFLECTED_TYPE(plFluidSettings, plNoBase, 3, plRTTIDefaultAllocator<plFluidSettings>)
 {
   PL_BEGIN_PROPERTIES
   {
@@ -410,6 +410,33 @@ public:
 };
 
 plFluidSettingsPatch_1_2 g_plFluidSettingsPatch_1_2;
+
+/// Gas temperature used to decay with the density. Documents from before Temperature Dissipation existed keep that.
+class plFluidSettingsPatch_2_3 : public plGraphPatch
+{
+public:
+  plFluidSettingsPatch_2_3()
+    : plGraphPatch("plFluidSettings", 3)
+  {
+  }
+
+  virtual void Patch(plGraphPatchContext& ref_context, plAbstractObjectGraph* pGraph, plAbstractObjectNode* pNode) const override
+  {
+    PL_IGNORE_UNUSED(ref_context);
+    PL_IGNORE_UNUSED(pGraph);
+
+    if (pNode->FindProperty("TemperatureDissipation") != nullptr)
+      return;
+
+    float fDensityDissipation = 0.98f;
+    if (auto* pDensity = pNode->FindProperty("DensityDissipation"); pDensity != nullptr && pDensity->m_Value.CanConvertTo<float>())
+      fDensityDissipation = pDensity->m_Value.ConvertTo<float>();
+
+    pNode->AddProperty("TemperatureDissipation", fDensityDissipation);
+  }
+};
+
+plFluidSettingsPatch_2_3 g_plFluidSettingsPatch_2_3;
 
 class plFluidVolumeComponentPatch_4_5 : public plGraphPatch
 {

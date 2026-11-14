@@ -163,7 +163,7 @@ const plFluidCloudsApplication::ClipInfo& plFluidCloudsApplication::GetClipInfo(
   return s_Clips[(int)clip];
 }
 
-void plFluidCloudsApplication::AddSunAndSky(float fLux)
+void plFluidCloudsApplication::AddSunAndSky(float fLux, bool bShadows)
 {
   plGameObjectDesc sunDesc;
   sunDesc.m_sName.Assign("Sun");
@@ -173,7 +173,7 @@ void plFluidCloudsApplication::AddSunAndSky(float fLux)
   plDirectionalLightComponent* pSun = nullptr;
   plDirectionalLightComponent::CreateComponent(pSunObject, pSun);
   pSun->SetIntensity(fLux);
-  pSun->SetCastShadows(true);
+  pSun->SetCastShadows(bShadows);
 
   plGameObjectDesc skyDesc;
   skyDesc.m_sName.Assign("Sky");
@@ -215,8 +215,8 @@ void plFluidCloudsApplication::SetCamera(const plVec3& vPosIn, const plVec3& vTa
   if (auto* pGameState = plDynamicCast<plFluidTestGameState*>(GetActiveGameState()))
   {
     // Kilometres up, nothing is near: a far near plane keeps the depth buffer precise out to the horizon.
-    // 1 m: a larger near plane makes the volumetric clouds vanish (engine bug, open).
-    float fNear = 1.0f;
+    // Kilometres up nothing is near: a far near plane keeps the depth buffer precise out to the horizon.
+    float fNear = plMath::Clamp(vPos.z * 0.002f, 0.5f, 100.0f);
     const plInt32 iNearOverride = plEnvironmentVariableUtils::GetValueInt("PL_FLUIDCLOUDS_NEAR", 0);
     if (iNearOverride > 0)
       fNear = static_cast<float>(iNearOverride);
@@ -225,7 +225,7 @@ void plFluidCloudsApplication::SetCamera(const plVec3& vPosIn, const plVec3& vTa
   }
 }
 
-plGameObject* plFluidCloudsApplication::AddBox(const char* szName, const plVec3& vCenter, const plVec3& vSize, const plColor& color, bool bFullbright)
+plGameObject* plFluidCloudsApplication::AddBox(const char* szName, const plVec3& vCenter, const plVec3& vSize, const plColor& color, bool bFullbright, bool bCastShadow)
 {
   plMeshResourceHandle& hMesh = bFullbright ? m_hGlowBoxMesh : m_hBoxMesh;
   if (!hMesh.IsValid())
@@ -250,7 +250,7 @@ plGameObject* plFluidCloudsApplication::AddBox(const char* szName, const plVec3&
   desc.m_LocalPosition = vCenter;
   desc.m_LocalScaling = vSize;
   desc.m_bDynamic = bFullbright;
-  if (!bFullbright)
+  if (!bFullbright && bCastShadow)
     desc.m_Tags.Set(plTagRegistry::GetGlobalRegistry().RegisterTag("CastShadow"));
   plGameObject* pObject = nullptr;
   m_pWorld->CreateObject(desc, pObject);
@@ -359,20 +359,30 @@ void plFluidCloudsApplication::SetupHurricane()
   weather.m_fLayerMax = 7500.0f;
   weather.m_fExtent = 96000.0f;
   // The environment: scattered fair-weather cumulus, which the circulation draws in and shreds.
-  weather.m_fAmbientDensity = 0.32f;
+  weather.m_fAmbientDensity = 0.5f;
   weather.m_fAmbientRate = 0.0008f;
-  weather.m_fAmbientScale = 6000.0f;
-  weather.m_fAmbientBreakup = 0.65f;
+  weather.m_fAmbientScale = 5000.0f;
+  weather.m_fAmbientBreakup = 0.75f;
   weather.m_fVorticity = 0.0f; // confinement scales with step and texel size: at time-lapse steps it blows the solver up
   weather.m_fVelocityDissipation = 0.998f;
   weather.m_fTemperatureDissipation = 0.98f;
   weather.m_fFlowPeriod = 100.0f; // with 2 s steps, a cycle every 50 frames
 
-  AddBox("Ocean", plVec3(0.0f, 0.0f, -10.0f), plVec3(400000.0f, 400000.0f, 20.0f), plColor(0.015f, 0.04f, 0.07f));
+  // The sea casts no shadow: a 400 km caster only adds acne to itself.
+  AddBox("Ocean", plVec3(0.0f, 0.0f, -10.0f), plVec3(400000.0f, 400000.0f, 20.0f), plColor(0.015f, 0.04f, 0.07f), false, false);
   plVolumetricCloudsComponent* pClouds = AddClouds(weather);
-  // Beyond the fluid the engine's default weather map takes over; halved, it reads as the same scattered cumulus.
-  pClouds->SetCoverageScale(0.55f);
-  pClouds->SetFluidCoverageScale(1.0f / 0.55f);
+  // Beyond the fluid the engine's default weather map takes over; scaled down, only its densest cells survive, as
+  // scattered cumulus. The fluid's own scale undoes the reduction, and maps density 1 to a coverage well inside the
+  // band the noise sculpts, so the bands keep soft, broken edges instead of solid walls.
+  pClouds->SetCoverageScale(0.4f);
+  pClouds->SetFluidCoverageScale(0.8f / 0.4f);
+  pClouds->SetFluidNdfDetail(0.6f / 0.4f);
+  // The cirrus canopy the storm's outflow spreads over its core: the cirrus coverage follows the fluid's density, and
+  // the bias keeps it off everywhere the storm is not dense.
+  pClouds->SetCirrusEnabled(true);
+  pClouds->SetCirrusAltitude(9500.0f);
+  pClouds->SetCirrusCoverageBias(-0.25f);
+  pClouds->SetCirrusDensity(0.8f);
   AddWeather(weather);
 
   // The circulation: a wide cyclonic swirl with inflow, and the tight core inside it. Positive swirl turns
@@ -422,6 +432,13 @@ void plFluidCloudsApplication::SetupHurricane()
     pTower->m_fTemperature = 0.25f;
   }
 
+  // The central dense overcast: broad, weak convection around the core that fills the gaps between the inner bands.
+  plFluidEmitterComponent* pOvercast = AddEmitter("CentralOvercast", plVec2::MakeZero());
+  pOvercast->m_Shape = plFluidEmitterShape::Sphere;
+  pOvercast->m_fRadius = 13000.0f;
+  pOvercast->m_fDensity = 0.0012f;
+  pOvercast->m_fTemperature = 0.01f;
+
   // The eye: sinking air that evaporates the cloud.
   plFluidEmitterComponent* pEye = AddEmitter("Eye", plVec2::MakeZero());
   pEye->m_Shape = plFluidEmitterShape::Sphere;
@@ -443,7 +460,7 @@ void plFluidCloudsApplication::SetupBeam()
   weather.m_fVelocityDissipation = 0.99f;
   weather.m_fTemperatureDissipation = 0.85f;
 
-  AddBox("Ground", plVec3(0.0f, 0.0f, -10.0f), plVec3(400000.0f, 400000.0f, 20.0f), plColor(0.10f, 0.13f, 0.06f));
+  AddBox("Ground", plVec3(0.0f, 0.0f, -10.0f), plVec3(400000.0f, 400000.0f, 20.0f), plColor(0.10f, 0.13f, 0.06f), false, false);
 
   // A town around the beam's foot, for scale.
   for (plUInt32 i = 0; i < 90; ++i)
@@ -476,7 +493,8 @@ void plFluidCloudsApplication::SetupBeam()
   m_hBeamRing.Invalidate();
 
   // The column of light, grown from the ground when the beam fires (SetFrame).
-  m_hBeamColumn = AddBox("BeamColumn", plVec3(0.0f, 0.0f, -100.0f), plVec3(45.0f, 45.0f, 1.0f), plColor(6.0f, 8.0f, 12.0f), true)->GetHandle();
+  // Bright enough that bloom gives it a halo; nearly white, so tonemapping does not push it toward violet.
+  m_hBeamColumn = AddBox("BeamColumn", plVec3(0.0f, 0.0f, -100.0f), plVec3(110.0f, 110.0f, 1.0f), plColor(52.0f, 56.0f, 60.0f), true)->GetHandle();
 }
 
 plResult plFluidCloudsApplication::SetupClip(Clip clip)
@@ -486,6 +504,8 @@ plResult plFluidCloudsApplication::SetupClip(Clip clip)
 
   SetCVar<plCVarBool>("Rendering.VolumetricClouds.Enabled", true);
   SetCVar<plCVarInt>("Rendering.VolumetricClouds.Quality", 3);
+  // Screen-space contact shadows hatch a flat ground seen from kilometres away (engine issue, open).
+  SetCVar<plCVarBool>("Rendering.ContactShadows.Enable", false);
   ApplyCVarOverrides();
   // The clouds' shaders run on the global clock; a fixed step keeps two runs identical.
   plClock::GetGlobalClock()->SetFixedTimeStep(plTime::MakeFromSeconds(1.0 / 30.0));
@@ -500,7 +520,7 @@ plResult plFluidCloudsApplication::SetupClip(Clip clip)
   m_hBeamRing.Invalidate();
   m_hBeamColumn.Invalidate();
 
-  AddSunAndSky(11.0f);
+  AddSunAndSky(11.0f, true);
 
   if (clip == Clip::HurricaneOrbit || clip == Clip::HurricaneEye)
     SetupHurricane();
@@ -548,8 +568,12 @@ void plFluidCloudsApplication::SetFrame(Clip clip, plInt32 iFrame, float fFluidS
         SetCamera(plVec3(-300.0f, -4600.0f, 2.0f), plVec3(0.0f, 0.0f, 2300.0f), 72.0f);
       else
         SetCamera(plVec3(5000.0f, -10000.0f, 7500.0f), plVec3(0.0f, 0.0f, 2200.0f), 55.0f);
-      // The sun behind the beam, so the shaft it lets through lands between the beam and the camera.
-      SetSun(52.0f, 95.0f);
+      // The sun behind the beam, so the shaft it lets through lands between the beam and the camera. From above, a
+      // lower sun models the deck's relief and the walls of the hole.
+      if (clip == Clip::BeamGround)
+        SetSun(52.0f, 95.0f);
+      else
+        SetSun(28.0f, 60.0f);
 
       // The beam fires 1.5 s in, ramps up over half a second and stays on.
       const float fOn = SmoothStep01((t - 1.5f) / 0.5f) * (iFrame >= 0 ? 1.0f : 0.0f);
@@ -571,7 +595,7 @@ void plFluidCloudsApplication::SetFrame(Clip clip, plInt32 iFrame, float fFluidS
         const float fHeight = 14000.0f * SmoothStep01((t - 1.3f) / 0.2f) * (iFrame >= 0 ? 1.0f : 0.0f);
         const float fPulse = 1.0f + 0.15f * plMath::Sin(plAngle::MakeFromRadian(t * 9.0f));
         pColumn->SetLocalPosition(plVec3(0.0f, 0.0f, fHeight * 0.5f));
-        pColumn->SetLocalScaling(plVec3(45.0f * fPulse, 45.0f * fPulse, plMath::Max(fHeight, 0.01f)));
+        pColumn->SetLocalScaling(plVec3(110.0f * fPulse, 110.0f * fPulse, plMath::Max(fHeight, 0.01f)));
       }
       break;
     }

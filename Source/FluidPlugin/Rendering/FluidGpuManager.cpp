@@ -188,6 +188,7 @@ struct plFluidGpuManager::Data
     plUInt8 m_uiMode = 0xFF;       ///< mode the textures were created for
     bool m_bObstacleValid = false; ///< false forces the obstacle pass, which a fresh texture always needs
     bool m_bPressureValid = false; ///< Gas: m_hPressure[0] holds last step's solved pressure, so a warm start may read it
+    float m_fSimulatedStep = 0.0f; ///< seconds the solver advanced this frame; 0 while asleep or frozen
 
     /// The bed texture, created with its data from m_pBedSource. A reference is kept so a new bed can never reuse the
     /// address of the one the texture was made from.
@@ -1333,7 +1334,9 @@ void plFluidGpuManager::Data::StepVolume(Volume& volume, World& world, plGALComm
   // A volume with nothing driving it stops stepping once its sources have been gone for long enough. Snow and Water
   // keep going while it snows or rains, because the precipitation is a source of its own. Water also keeps going long
   // enough for its waves to settle, since a frozen swell would hang in mid air.
-  const bool bHasInput = !input.m_Sources.IsEmpty() || (uiMode != plFluidMode::Gas && input.m_fPrecipitation > 0.0f);
+  // Gas with an ambient field it relaxes toward is never idle either: the field is a source spread over the grid.
+  const bool bAmbient = uiMode == plFluidMode::Gas && settings.m_fAmbientRate > 0.0f && settings.m_fAmbientDensity > 0.0f;
+  const bool bHasInput = !input.m_Sources.IsEmpty() || bAmbient || (uiMode != plFluidMode::Gas && input.m_fPrecipitation > 0.0f);
   const float fSleepAfter = bWater ? plMath::Max(input.m_fSleepAfter, FluidWaterMinSleepAfter) : plMath::Max(input.m_fSleepAfter, 0.0f);
 
   volume.m_fIdleSeconds = bHasInput ? 0.0f : volume.m_fIdleSeconds + fStepTime;
@@ -1429,6 +1432,7 @@ void plFluidGpuManager::Data::StepVolume(Volume& volume, World& world, plGALComm
   }
 
   pConstants->SolverStepTime = fStepTime;
+  volume.m_fSimulatedStep = bRunSolver ? fStepTime : 0.0f;
   pConstants->SolverSubStepTime = fSubStepTime;
   pConstants->SolverSubSteps = uiSubSteps;
   pConstants->SolverOpenDepth = fOpenDepth;
@@ -1986,12 +1990,6 @@ void plFluidGpuManager::Data::UpdateWorld(plUInt32 uiWorldIndex, World& world)
     return;
   }
 
-  // The step the solver takes this frame (StepVolume clamps it the same way), and the simulated time those steps add
-  // up to. Consumers that carry something along the flow need exactly the distance the solver moved the fluid.
-  const float fPublishedStep = plMath::Clamp(static_cast<float>(active[0]->m_Input.m_DeltaTime.GetSeconds()), 0.0f, plMath::Max(cvar_FluidMaxStepTime.GetValue(), 0.001f));
-  world.m_fSimulatedTime += fPublishedStep;
-  pWorldConstants->FluidDeltaTime = fPublishedStep;
-  pWorldConstants->FluidTime = static_cast<float>(plMath::Mod(world.m_fSimulatedTime, 1000.0));
 
   // Atlas or table just (re)created: their contents are undefined until this frame's command list runs, which on the
   // threaded path is after the views read them. Publishing no volumes makes every consumer skip the textures, and
@@ -2027,6 +2025,12 @@ void plFluidGpuManager::Data::UpdateWorld(plUInt32 uiWorldIndex, World& world)
     WriteTable(world, active.GetArrayPtr(), pEncoder);
   }
   pDevice->EndCommands(pEncoder);
+
+  // The step the first volume's solver took this frame (0 while it sleeps), and the simulated time those steps add up
+  // to. Consumers that carry something along the flow need exactly the distance the solver moved the fluid.
+  world.m_fSimulatedTime += active[0]->m_fSimulatedStep;
+  pWorldConstants->FluidDeltaTime = active[0]->m_fSimulatedStep;
+  pWorldConstants->FluidTime = static_cast<float>(plMath::Mod(world.m_fSimulatedTime, 1000.0));
 }
 
 void plFluidGpuManager::Data::WriteTable(World& world, plArrayPtr<Volume* const> activeVolumes, plGALCommandEncoder* pEncoder)
