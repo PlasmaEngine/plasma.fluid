@@ -159,6 +159,8 @@ const plFluidCloudsApplication::ClipInfo& plFluidCloudsApplication::GetClipInfo(
     {"HurricaneEye", "Hurricane - inside the eye", 450, 500, 12.0f, 2.0f},
     {"BeamGround", "Beam parting the clouds - from the ground", 450, 40, 0.15f, 0.15f},
     {"BeamAerial", "Beam parting the clouds - from above", 450, 40, 0.15f, 0.15f},
+    {"HurricaneSatellite", "Hurricane - seen from 130 km", 450, 500, 12.0f, 3.0f},
+    {"BeamSweep", "Beam sweeping across the sky, parting the deck", 540, 40, 0.15f, 0.15f},
   };
   return s_Clips[(int)clip];
 }
@@ -331,7 +333,7 @@ void plFluidCloudsApplication::AddWeather(const WeatherSetup& weather)
   s.m_fAmbientRate = weather.m_fAmbientRate;
   s.m_fAmbientScale = weather.m_fAmbientScale;
   s.m_fAmbientBreakup = weather.m_fAmbientBreakup;
-  s.m_fEdgeFade = weather.m_fExtent * 0.08f;
+  s.m_fEdgeFade = weather.m_fExtent * weather.m_fEdgeFade;
   pVolume->SetOverrideSettings(true);
 }
 
@@ -367,6 +369,7 @@ void plFluidCloudsApplication::SetupHurricane()
   weather.m_fVelocityDissipation = 0.998f;
   weather.m_fTemperatureDissipation = 0.98f;
   weather.m_fFlowPeriod = 100.0f; // with 2 s steps, a cycle every 50 frames
+  weather.m_fEdgeFade = 0.22f;     // the scattered cumulus thins out over 20 km instead of stopping at a square edge
 
   // The sea casts no shadow: a 400 km caster only adds acne to itself.
   AddBox("Ocean", plVec3(0.0f, 0.0f, -10.0f), plVec3(400000.0f, 400000.0f, 20.0f), plColor(0.015f, 0.04f, 0.07f), false, false);
@@ -446,14 +449,15 @@ void plFluidCloudsApplication::SetupHurricane()
   pEye->m_fDensity = -0.06f;
 }
 
-void plFluidCloudsApplication::SetupBeam()
+void plFluidCloudsApplication::SetupBeam(bool bSweep)
 {
   WeatherSetup weather;
   weather.m_fLayerMin = 1400.0f;
   weather.m_fLayerMax = 3600.0f;
   weather.m_fExtent = 64000.0f;
   weather.m_fAmbientDensity = 0.85f;
-  weather.m_fAmbientRate = 0.01f;
+  // A channel the sweeping beam cuts must stay open for the rest of the clip; a single hole may heal.
+  weather.m_fAmbientRate = bSweep ? 0.0015f : 0.01f;
   weather.m_fAmbientScale = 2500.0f;
   weather.m_fAmbientBreakup = 0.3f;
   weather.m_fVorticity = 0.006f;
@@ -487,7 +491,7 @@ void plFluidCloudsApplication::SetupBeam()
 
   plFluidEmitterComponent* pClear = AddEmitter("BeamClear", plVec2::MakeZero());
   pClear->m_Shape = plFluidEmitterShape::Sphere;
-  pClear->m_fRadius = 900.0f;
+  pClear->m_fRadius = bSweep ? 1300.0f : 900.0f;
   m_hBeamClear = pClear->GetHandle();
 
   m_hBeamRing.Invalidate();
@@ -522,10 +526,10 @@ plResult plFluidCloudsApplication::SetupClip(Clip clip)
 
   AddSunAndSky(11.0f, true);
 
-  if (clip == Clip::HurricaneOrbit || clip == Clip::HurricaneEye)
+  if (clip == Clip::HurricaneOrbit || clip == Clip::HurricaneEye || clip == Clip::HurricaneSatellite)
     SetupHurricane();
   else
-    SetupBeam();
+    SetupBeam(clip == Clip::BeamSweep);
 
   SetFrame(clip, -GetClipInfo(clip).m_iWarmupFrames, 0.0f);
   return PL_SUCCESS;
@@ -558,6 +562,53 @@ void plFluidCloudsApplication::SetFrame(Clip clip, plInt32 iFrame, float fFluidS
       const plVec3 vPos(-600.0f, -400.0f, 900.0f);
       SetCamera(vPos, vPos + plVec3(plMath::Cos(yaw), plMath::Sin(yaw), 0.42f) * 1000.0f, 75.0f);
       SetSun(62.0f, 200.0f);
+      break;
+    }
+
+    case Clip::HurricaneSatellite:
+    {
+      // Straight down from orbit height, drifting slowly across the storm.
+      const float fDrift = -6000.0f + 12000.0f * (t / fClipLength);
+      SetCamera(plVec3(fDrift, -18000.0f, 130000.0f), plVec3(fDrift * 0.5f, 0.0f, 0.0f), 42.0f);
+      SetSun(55.0f, 150.0f);
+      break;
+    }
+
+    case Clip::BeamSweep:
+    {
+      // Nearly under the beam's path, looking up across it, so the channel opens across the sky overhead.
+      SetCamera(plVec3(0.0f, -2200.0f, 2.0f), plVec3(0.0f, 600.0f, 2600.0f), 90.0f);
+      SetSun(50.0f, 95.0f);
+
+      // Fires 1.5 s in at the west end, holds a second while the hole opens, then drags east at 270 m/s, parting
+      // the deck along its path.
+      const float fOn = SmoothStep01((t - 1.5f) / 0.5f) * (iFrame >= 0 ? 1.0f : 0.0f);
+      const float fTravel = plMath::Clamp((t - 2.5f) / 13.0f, 0.0f, 1.0f);
+      const plVec2 vBeam(-9000.0f + 18000.0f * SmoothStep01(fTravel), 0.0f);
+
+      plFluidEmitterComponent* pBeam = nullptr;
+      if (m_pWorld->TryGetComponent(m_hBeam, pBeam))
+      {
+        pBeam->GetOwner()->SetLocalPosition(plVec3(vBeam.x, vBeam.y, m_fWeatherHeight));
+        pBeam->m_fDrain = -110.0f * fOn;
+        pBeam->m_fSwirl = 8.0f * fOn;
+        pBeam->m_fTemperature = 0.8f * fOn;
+      }
+      plFluidEmitterComponent* pClear = nullptr;
+      if (m_pWorld->TryGetComponent(m_hBeamClear, pClear))
+      {
+        pClear->GetOwner()->SetLocalPosition(plVec3(vBeam.x, vBeam.y, m_fWeatherHeight));
+        pClear->m_bTrail = true; // smeared along each step's path, so a fast beam leaves no gaps
+        pClear->m_fDensity = -3.0f * fOn;
+      }
+      plGameObject* pColumn = nullptr;
+      if (m_pWorld->TryGetObject(m_hBeamColumn, pColumn))
+      {
+        const float fHeight = 14000.0f * SmoothStep01((t - 1.3f) / 0.2f) * (iFrame >= 0 ? 1.0f : 0.0f);
+        const float fPulse = 1.0f + 0.15f * plMath::Sin(plAngle::MakeFromRadian(t * 9.0f));
+        pColumn->SetLocalPosition(plVec3(vBeam.x, vBeam.y, fHeight * 0.5f));
+        pColumn->SetLocalScaling(plVec3(110.0f * fPulse, 110.0f * fPulse, plMath::Max(fHeight, 0.01f)));
+      }
       break;
     }
 
@@ -643,6 +694,8 @@ void plGameEngineTestFluidClouds::SetupSubTests()
   AddSubTest("HurricaneEye", (plInt32)plFluidCloudsApplication::Clip::HurricaneEye);
   AddSubTest("BeamGround", (plInt32)plFluidCloudsApplication::Clip::BeamGround);
   AddSubTest("BeamAerial", (plInt32)plFluidCloudsApplication::Clip::BeamAerial);
+  AddSubTest("HurricaneSatellite", (plInt32)plFluidCloudsApplication::Clip::HurricaneSatellite);
+  AddSubTest("BeamSweep", (plInt32)plFluidCloudsApplication::Clip::BeamSweep);
 }
 
 plResult plGameEngineTestFluidClouds::InitializeSubTest(plInt32 iIdentifier)

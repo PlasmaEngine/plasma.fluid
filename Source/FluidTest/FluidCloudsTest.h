@@ -42,6 +42,8 @@ public:
     HurricaneEye,   ///< standing in the clear eye, looking around at the eyewall
     BeamGround,     ///< under an overcast deck, a beam punches a hole and the sun pours through
     BeamAerial,     ///< the same from above the deck
+    HurricaneSatellite, ///< the storm straight down from orbit height
+    BeamSweep,      ///< the beam drags across the sky and parts the deck along its path
     Count
   };
 
@@ -85,6 +87,7 @@ private:
     float m_fTemperatureDissipation = 0.9f;
     plUInt32 m_uiPressureIterations = 40;
     float m_fFlowPeriod = 25.0f; ///< fluid seconds per cycle of the clouds' flow-mapped noise
+    float m_fEdgeFade = 0.08f;   ///< share of the extent over which the fluid hands over to the default weather at its border
   };
 
   void AddSunAndSky(float fLux, bool bShadows);
@@ -96,7 +99,7 @@ private:
   plFluidEmitterComponent* AddEmitter(const char* szName, const plVec2& vPos);
 
   void SetupHurricane();
-  void SetupBeam();
+  void SetupBeam(bool bSweep);
 
   plMeshResourceHandle m_hBoxMesh;
   plMeshResourceHandle m_hGlowBoxMesh;
