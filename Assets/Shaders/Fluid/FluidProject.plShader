@@ -38,10 +38,10 @@ void main(uint3 id : SV_DispatchThreadID)
   bool bSolidUp = FluidIsSolid(FluidObstacleInput, vTexel + int2(0, 1));
   bool bSolidDown = FluidIsSolid(FluidObstacleInput, vTexel - int2(0, 1));
 
-  float fRight = bSolidRight ? fCentre : FluidLoadR(FluidPressureInput, vTexel + int2(1, 0));
-  float fLeft = bSolidLeft ? fCentre : FluidLoadR(FluidPressureInput, vTexel - int2(1, 0));
-  float fUp = bSolidUp ? fCentre : FluidLoadR(FluidPressureInput, vTexel + int2(0, 1));
-  float fDown = bSolidDown ? fCentre : FluidLoadR(FluidPressureInput, vTexel - int2(0, 1));
+  float fRight = bSolidRight ? fCentre : FluidPressureNeighbour(FluidPressureInput, vTexel + int2(1, 0));
+  float fLeft = bSolidLeft ? fCentre : FluidPressureNeighbour(FluidPressureInput, vTexel - int2(1, 0));
+  float fUp = bSolidUp ? fCentre : FluidPressureNeighbour(FluidPressureInput, vTexel + int2(0, 1));
+  float fDown = bSolidDown ? fCentre : FluidPressureNeighbour(FluidPressureInput, vTexel - int2(0, 1));
 
   state.xy -= 0.5 * float2(fRight - fLeft, fUp - fDown);
 
@@ -52,7 +52,8 @@ void main(uint3 id : SV_DispatchThreadID)
   if (bSolidUp) state.y = min(state.y, 0.0);
   if (bSolidDown) state.y = max(state.y, 0.0);
 
-  // An open boundary lets fluid leave; a closed one is already walled off by the obstacle pass.
+  // An open boundary lets fluid leave; a closed one is already walled off by the obstacle pass; a free one lets the
+  // pressure decide, both ways.
   if (SolverBoundary == FLUID_BOUNDARY_OPEN)
   {
     if (id.x == 0) state.x = min(state.x, 0.0);

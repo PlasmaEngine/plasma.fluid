@@ -466,7 +466,8 @@ void plFluidWorldModule::UpdateVolumes(const plWorldModule::UpdateContext& conte
 
       if (pVolume->m_bUseWind && pWind != nullptr)
       {
-        input.m_vWind = pWind->GetWindAt(input.m_Transform.m_vPosition) * settings.m_fWindStrength;
+        // Raw scene wind: the GPU manager applies Wind Strength when it converts the wind into the plane.
+        input.m_vWind = pWind->GetWindAt(input.m_Transform.m_vPosition);
       }
 
       if (pVolume->m_bUseWeather)

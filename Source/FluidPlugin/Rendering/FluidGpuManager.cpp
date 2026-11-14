@@ -147,6 +147,19 @@ namespace
 
     return bAllFit;
   }
+
+  /// Gas: the ambient field's constants. Authored per second and in metres; the kernels take a share per step and noise
+  /// cycles per texel. A zero step (the clear pass) fills only what the initial state needs.
+  void FillAmbientConstants(plFluidSolverConstants& inout_constants, const plFluidVolumeInput& input, plUInt32 uiResolution, float fStepTime)
+  {
+    const plFluidSettings& settings = input.m_Settings;
+    const float fTexelSize = plMath::Max(input.m_vExtents.x, 0.01f) / static_cast<float>(plMath::Max(uiResolution, 1u));
+
+    inout_constants.SolverAmbientDensity = plMath::Max(settings.m_fAmbientDensity, 0.0f);
+    inout_constants.SolverAmbientFrequency = fTexelSize / plMath::Max(settings.m_fAmbientScale, 0.1f);
+    inout_constants.SolverAmbientBreakup = plMath::Clamp(settings.m_fAmbientBreakup, 0.0f, 1.0f);
+    inout_constants.SolverAmbientRelax = 1.0f - plMath::Exp(-plMath::Max(settings.m_fAmbientRate, 0.0f) * fStepTime);
+  }
 } // namespace
 
 struct plFluidGpuManager::Data
@@ -174,6 +187,7 @@ struct plFluidGpuManager::Data
     plUInt32 m_uiResolution = 0;   ///< resolution the textures were created at
     plUInt8 m_uiMode = 0xFF;       ///< mode the textures were created for
     bool m_bObstacleValid = false; ///< false forces the obstacle pass, which a fresh texture always needs
+    bool m_bPressureValid = false; ///< Gas: m_hPressure[0] holds last step's solved pressure, so a warm start may read it
 
     /// The bed texture, created with its data from m_pBedSource. A reference is kept so a new bed can never reuse the
     /// address of the one the texture was made from.
@@ -218,6 +232,10 @@ struct plFluidGpuManager::Data
     /// submitted after the view graphs, so views of this frame would read them before anything wrote them. Such a
     /// frame publishes no volumes; the solver still fills them, and the next frame reads valid data.
     bool m_bFreshResources = false;
+
+    /// Seconds the world's volumes have simulated, the clamped steps summed: what FluidTime publishes, so consumers that
+    /// move things along the flow (flow-mapped clouds) agree with how far the solver carried them.
+    double m_fSimulatedTime = 0.0;
   };
 
   plMutex m_Mutex;
@@ -795,6 +813,7 @@ void plFluidGpuManager::Data::EnsureVolumeResources(Volume& volume, plUInt32 uiR
   volume.m_uiMode = uiMode;
   volume.m_uiCurrent = 0;
   volume.m_bObstacleValid = false;
+  volume.m_bPressureValid = false;
 
   // A fresh texture holds undefined data. The state pair and Water's aux pair are the only ones read before they are
   // fully written, so they are the only ones that have to be filled; obstacle, divergence and pressure are rewritten
@@ -809,6 +828,10 @@ void plFluidGpuManager::Data::EnsureVolumeResources(Volume& volume, plUInt32 uiR
 
     if (uiMode == plFluidMode::Snow)
       pInit->SolverInitialState.x = plMath::Max(fInitialDepth, 0.0f);
+
+    pInit->SolverMode = uiMode;
+    if (uiMode == plFluidMode::Gas)
+      FillAmbientConstants(*pInit, volume.m_Input, uiResolution, 0.0f);
   }
 
   const plUInt32 uiGroups = ThreadGroups(uiResolution);
@@ -1359,10 +1382,17 @@ void plFluidGpuManager::Data::StepVolume(Volume& volume, World& world, plGALComm
   // Dissipation and decay are authored per second; the solver applies them once per step.
   pConstants->SolverDensityDissipation = plMath::Pow(plMath::Clamp(settings.m_fDensityDissipation, 0.0f, 1.0f), fStepTime);
   pConstants->SolverVelocityDissipation = plMath::Pow(plMath::Clamp(settings.m_fVelocityDissipation, 0.0f, 1.0f), fStepTime);
+  pConstants->SolverTemperatureDissipation = plMath::Pow(plMath::Clamp(settings.m_fTemperatureDissipation, 0.0f, 1.0f), fStepTime);
   pConstants->SolverBuoyancy = settings.m_fBuoyancy;
   pConstants->SolverAmbientTemperature = settings.m_fAmbientTemperature;
   pConstants->SolverVorticity = settings.m_fVorticity;
   pConstants->SolverViscosity = settings.m_fViscosity;
+  pConstants->SolverDensityWeight = settings.m_fDensityWeight;
+  FillAmbientConstants(*pConstants, input, uiRes, fStepTime);
+  if (uiMode == plFluidMode::Gas && settings.m_bWarmStartPressure && volume.m_bPressureValid)
+    pConstants->SolverFlags |= FLUID_FLAG_WARM_START;
+  if (!settings.m_bDrainRemovesGas)
+    pConstants->SolverFlags |= FLUID_FLAG_DRAIN_KEEPS_GAS;
 
   // Water sub-steps. The explicit shallow water step is stable while a wave crosses at most half a texel per sub-step
   // (the wave speed is sqrt(g * depth), bounded because deeper ground counts as Depth), and depths stay positive while
@@ -1383,7 +1413,7 @@ void plFluidGpuManager::Data::StepVolume(Volume& volume, World& world, plGALComm
     float fPlannedFlow = FluidWaterMinPlannedFlow;
     for (const plFluidWorldSource& src : input.m_Sources)
     {
-      fPlannedFlow = plMath::Max(fPlannedFlow, src.m_vVelocity.GetLength(), plMath::Abs(src.m_fSwirl), src.m_fDrain);
+      fPlannedFlow = plMath::Max(fPlannedFlow, src.m_vVelocity.GetLength(), plMath::Abs(src.m_fSwirl), plMath::Abs(src.m_fDrain));
     }
 
     const float fWaveSpeed = plMath::Sqrt(fGravity * (fOpenDepth + fCrestMargin));
@@ -1701,8 +1731,12 @@ void plFluidGpuManager::Data::StepVolume(Volume& volume, World& world, plGALComm
       EndWrite(volume.m_hPressure[0]);
       ++uiDispatches;
 
-      const plUInt32 uiIterations = plMath::Clamp<plUInt32>(
+      plUInt32 uiIterations = plMath::Clamp<plUInt32>(
         static_cast<plUInt32>(settings.m_uiPressureIterations * plMath::Clamp(cvar_FluidPressureIterationScale.GetValue(), 0.1f, 2.0f)), 1, 80);
+
+      // A warm start reads m_hPressure[0] as the first guess, so the solve must also end there: an even count.
+      if (settings.m_bWarmStartPressure)
+        uiIterations = plMath::Max<plUInt32>((uiIterations + 1) & ~1u, 2);
 
       plUInt32 uiPressureRead = 0;
       for (plUInt32 i = 0; i < uiIterations; ++i)
@@ -1747,6 +1781,7 @@ void plFluidGpuManager::Data::StepVolume(Volume& volume, World& world, plGALComm
       EndWrite(hStateWrite);
 
       volume.m_uiCurrent = 1 - volume.m_uiCurrent;
+      volume.m_bPressureValid = uiPressureRead == 0;
       ++uiDispatches;
     }
     else
@@ -1951,8 +1986,12 @@ void plFluidGpuManager::Data::UpdateWorld(plUInt32 uiWorldIndex, World& world)
     return;
   }
 
-  pWorldConstants->FluidDeltaTime = static_cast<float>(active[0]->m_Input.m_DeltaTime.GetSeconds());
-  pWorldConstants->FluidTime = static_cast<float>(plMath::Mod(plRenderWorld::GetFrameCounter() / 60.0, 1000.0));
+  // The step the solver takes this frame (StepVolume clamps it the same way), and the simulated time those steps add
+  // up to. Consumers that carry something along the flow need exactly the distance the solver moved the fluid.
+  const float fPublishedStep = plMath::Clamp(static_cast<float>(active[0]->m_Input.m_DeltaTime.GetSeconds()), 0.0f, plMath::Max(cvar_FluidMaxStepTime.GetValue(), 0.001f));
+  world.m_fSimulatedTime += fPublishedStep;
+  pWorldConstants->FluidDeltaTime = fPublishedStep;
+  pWorldConstants->FluidTime = static_cast<float>(plMath::Mod(world.m_fSimulatedTime, 1000.0));
 
   // Atlas or table just (re)created: their contents are undefined until this frame's command list runs, which on the
   // threaded path is after the views read them. Publishing no volumes makes every consumer skip the textures, and
@@ -2059,7 +2098,8 @@ void plFluidGpuManager::Data::WriteTable(World& world, plArrayPtr<Volume* const>
 
   plGALSystemMemoryDescription memDesc;
   memDesc.m_uiRowPitch = FLUID_TABLE_ROWS * sizeof(plVec4);
-  memDesc.m_pData = plMakeByteBlobPtr(rows.GetData(), memDesc.m_uiRowPitch * FLUID_MAX_VOLUMES);
+  // The typed overload takes an element count, not bytes.
+  memDesc.m_pData = plMakeByteBlobPtr(rows.GetData(), rows.GetCount());
 
   pEncoder->UpdateTexture(world.m_hTable, plGALTextureSubresource(), destBox, memDesc);
 }

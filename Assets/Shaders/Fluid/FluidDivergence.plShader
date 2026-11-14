@@ -51,14 +51,19 @@ void main(uint3 id : SV_DispatchThreadID)
   for (uint i = 0; i < vRange.y; ++i)
   {
     plFluidSourceGpu src = FluidSources[FluidSourceIndices[vRange.x + i]];
-    if ((uint)src.Shape != FLUID_SOURCE_VORTEX || src.Drain <= 0.0)
+    if ((uint)src.Shape != FLUID_SOURCE_VORTEX || src.Drain == 0.0)
       continue;
 
     float fRadius = max(src.Radius, 1.0);
     float fCore = FluidVortexCore(length(vTexelPos - src.Position), fRadius) * saturate(1.0 - src.HeightFade);
-    fDivergence += 2.0 * min(src.Drain, fMaxDrain) / fRadius * fCore;
+    // A negative Drain is a source of the same strength: the solve leaves an outflow.
+    fDivergence += 2.0 * clamp(src.Drain, -fMaxDrain, fMaxDrain) / fRadius * fCore;
   }
 
   FluidDivergenceOutput[id.xy] = fDivergence;
-  FluidPressureOutput[id.xy] = 0.0;
+
+  // A warm start keeps last step's pressure as the first guess. Jacobi spreads a correction one texel per iteration,
+  // so a source or a sink only reaches across a large grid when the solve carries on from where it stopped.
+  if ((SolverFlags & FLUID_FLAG_WARM_START) == 0)
+    FluidPressureOutput[id.xy] = 0.0;
 }

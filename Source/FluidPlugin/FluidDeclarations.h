@@ -41,6 +41,7 @@ struct plFluidBoundary
     Open,   ///< fluid leaves and does not come back
     Closed, ///< the border is a wall
     Wrap,   ///< tiles with itself, which is what a baked tiling flowmap needs
+    Free,   ///< Gas: open air at rest beyond the border; flow crosses it both ways, so sources and drains can run for ever
 
     Default = Open
   };
@@ -74,6 +75,7 @@ struct plFluidEmitterShape
     Cone,   ///< injects along its own axis; the emitter's velocity sets the direction
     Vortex,  ///< swirls Gas and Water around the emitter's centre, optionally draining it inward: a whirlpool
     Capsule, ///< a segment along the emitter's local X, Extents.x long to each side, with Radius around it
+    Ring,    ///< Gas: an annulus of Radius around the emitter, Extents.x wide to each side: an eyewall, the wall a blast piles up
 
     Default = Sphere
   };
@@ -149,6 +151,15 @@ struct PL_FLUIDPLUGIN_DLL plFluidSettings
   float m_fBuoyancy = 1.0f;
   float m_fAmbientTemperature = 0.0f;
   float m_fVorticity = 0.3f;
+  float m_fTemperatureDissipation = 0.98f; ///< share of the temperature surviving one second
+  float m_fDensityWeight = 0.1f;   ///< m/s^2 along the volume's -Y per unit of density; 0 for a horizontal sky plane
+  bool m_bWarmStartPressure = false; ///< the pressure solve continues from last step; sources and sinks then reach across large grids
+  bool m_bDrainRemovesGas = true;    ///< a draining Vortex removes the gas in its core (smoke down a drain); off for weather, where converging air makes cloud
+  /// The ambient field: a background density the gas starts as and relaxes back toward, a cloud deck for a sky volume.
+  float m_fAmbientDensity = 0.0f;   ///< 0 for none
+  float m_fAmbientRate = 0.0f;      ///< per second, how fast the gas returns to the ambient field; 0 only seeds it
+  float m_fAmbientScale = 2000.0f;  ///< metres across one cell of the ambient noise
+  float m_fAmbientBreakup = 0.5f;   ///< 0 an even deck, 1 scattered clumps with clear gaps between
 
   // Water. Shallow water over the ground the volume bakes, or over open water Depth deep where there is none.
   float m_fDepth = 2.0f;       ///< metres of open water; deeper ground counts as this deep. Waves travel at sqrt(9.81 * Depth) m/s
@@ -196,7 +207,7 @@ struct PL_FLUIDPLUGIN_DLL plFluidSettings
 
   /// \brief Layout version Save writes. Fluid presets and volume components both store their settings through
   /// Save and Load, so the two layouts cannot drift apart.
-  static constexpr plUInt8 SerializationVersion = 6;
+  static constexpr plUInt8 SerializationVersion = 7;
 
   /// \brief Writes every field in the SerializationVersion layout. Writes no version byte; the caller stores it.
   void Save(plStreamWriter& inout_stream) const;
@@ -224,7 +235,7 @@ struct plFluidWorldSource
   float m_fPress = 0.0f;
   float m_fFalloff = 1.0f;
   float m_fSwirl = 0.0f; ///< Vortex: tangential speed at the edge of the core, m/s; positive is counter-clockwise seen from the fluid volume's +Z
-  float m_fDrain = 0.0f; ///< Vortex: inflow speed toward the centre, m/s
+  float m_fDrain = 0.0f; ///< Vortex: inflow speed toward the centre, m/s; negative pushes outward
   plUInt8 m_uiShape = 0; ///< plFluidEmitterShape
 };
 

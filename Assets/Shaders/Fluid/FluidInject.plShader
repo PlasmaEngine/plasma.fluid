@@ -19,7 +19,8 @@ RWTexture2D<float4> FluidStateOutput BIND_GROUP(BG_DRAW_CALL);
 // Relaxes the velocity toward a Rankine vortex around the source: tangential speed Swirl at the core edge and inflow
 // Drain, both rising linearly inside the core and falling off as 1/r outside. Relaxing toward a fixed target bounds
 // the speed by the target itself, however long the source stays. Density and temperature are added inside the core;
-// density inside the core drains away at the rate the inflow crosses the core, so smoke spirals in and vanishes.
+// density inside the core drains away at the rate the flow crosses the core, so smoke spirals in and vanishes. A
+// negative Drain is an outflow: the core is a source of clear air that pushes everything around it outward.
 void InjectVortex(plFluidSourceGpu src, float2 vTexelPos, float fStep, inout float4 state)
 {
   float fRadius = max(src.Radius, 1.0);
@@ -29,7 +30,7 @@ void InjectVortex(plFluidSourceGpu src, float2 vTexelPos, float fStep, inout flo
   if (fReach <= 0.0)
     return;
 
-  float fDrain = max(src.Drain, 0.0);
+  float fDrain = src.Drain;
   float2 vRadial = vDelta / max(fDist, 1e-3);
   float2 vTangent = float2(-vRadial.y, vRadial.x); // counter-clockwise seen from +Z
   float2 vTarget = (vTangent * src.Swirl - vRadial * fDrain) * FluidVortexShape(fDist, fRadius);
@@ -41,8 +42,13 @@ void InjectVortex(plFluidSourceGpu src, float2 vTexelPos, float fStep, inout flo
   state.z += src.Density * fCore * fStep;
   state.w += src.Temperature * fCore * fStep;
 
-  float fCoreMetres = fRadius * SolverTexelSize;
-  state.z *= exp(-fCore * fDrain * fStep / max(fCoreMetres, 1e-3));
+  // Smoke going down a drain leaves with the air. Air that converges and rises out of a weather layer does not take
+  // the cloud with it (it makes more), so a sky volume keeps the gas.
+  if ((SolverFlags & FLUID_FLAG_DRAIN_KEEPS_GAS) == 0)
+  {
+    float fCoreMetres = fRadius * SolverTexelSize;
+    state.z *= exp(-fCore * abs(fDrain) * fStep / max(fCoreMetres, 1e-3));
+  }
 }
 
 [numthreads(FLUID_SOLVER_THREADS, FLUID_SOLVER_THREADS, 1)]
@@ -98,7 +104,8 @@ void main(uint3 id : SV_DispatchThreadID)
       // plume rising out of it.
       if (dot(src.Velocity, src.Velocity) > 1e-6)
         state.xy = lerp(state.xy, src.Velocity, saturate(10.0 * fStep) * fWeight);
-      state.z += src.Density * fWeight * fStep;
+      // A negative Density clears the gas it covers; density never goes below zero.
+      state.z = max(state.z + src.Density * fWeight * fStep, 0.0);
       state.w += src.Temperature * fWeight * fStep;
     }
     else // Snow

@@ -45,7 +45,16 @@ void main(uint3 id : SV_DispatchThreadID)
 
   // Buoyancy lifts hot, dense smoke along the volume's local +Y and density weighs it back down.
   float fTemperature = state.w - SolverAmbientTemperature;
-  state.y += (SolverBuoyancy * fTemperature - 0.1 * state.z) * fStep;
+  state.y += (SolverBuoyancy * fTemperature - SolverDensityWeight * state.z) * fStep;
+
+  // The ambient field: density relaxes toward it, so a deck the flow has torn open slowly forms again. Temperature
+  // relaxes toward ambient at the same rate, so heat a source left behind does not linger for ever.
+  [branch]
+  if (SolverAmbientRelax > 0.0)
+  {
+    state.z = lerp(state.z, FluidGasAmbient(float2(vTexel) + 0.5), SolverAmbientRelax);
+    state.w = lerp(state.w, SolverAmbientTemperature, SolverAmbientRelax);
+  }
 
   state.xy += SolverWind * fStep;
 

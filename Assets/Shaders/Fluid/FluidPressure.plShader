@@ -24,7 +24,7 @@ float PressureAt(int2 vTexel, float fCentre)
   if (FluidIsSolid(FluidObstacleInput, vTexel))
     return fCentre;
 
-  return FluidLoadR(FluidPressureInput, vTexel);
+  return FluidPressureNeighbour(FluidPressureInput, vTexel);
 }
 
 [numthreads(FLUID_SOLVER_THREADS, FLUID_SOLVER_THREADS, 1)]

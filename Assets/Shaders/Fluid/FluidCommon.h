@@ -54,6 +54,23 @@ float4 FluidSampleBilinear(Texture2D<float4> tex, float2 vTexelPos)
   return lerp(lerp(s00, s10, f.x), lerp(s01, s11, f.x), f.y);
 }
 
+// True for a texel coordinate beyond the grid's border.
+bool FluidOutsideGrid(int2 vTexel)
+{
+  return any(vTexel < 0) || any(vTexel >= int2(SolverRes));
+}
+
+// Pressure at a neighbour texel for the solve and the projection. Beyond a Free border lies open air at rest pressure,
+// zero, so a source or a sink drains through the border instead of having nowhere to go; every other border reads the
+// edge texel, the zero-gradient condition that lets nothing through.
+float FluidPressureNeighbour(Texture2D<float4> pressure, int2 vTexel)
+{
+  if (SolverBoundary == FLUID_BOUNDARY_FREE && FluidOutsideGrid(vTexel))
+    return 0.0;
+
+  return pressure.Load(int3(FluidWrapTexel(vTexel), 0)).x;
+}
+
 bool FluidIsSolid(Texture2D<float4> obstacle, int2 vTexel)
 {
   return FluidLoadR(obstacle, vTexel) > 0.5;
@@ -166,9 +183,30 @@ float FluidSourceWeight(plFluidSourceGpu src, float2 vTexelPos)
     return saturate(1.0 - fAcross / max(fHalfWidth, 0.5)) * saturate(1.0 - fAlong / fLength);
   }
 
+  if (uiShape == FLUID_SOURCE_RING)
+  {
+    // An annulus around Position, not the trail: Extents.x is its half width, Falloff how soft its two edges are.
+    float fHalfWidth = max(src.Extents.x, 0.5);
+    float fRingDist = abs(length(vTexelPos - src.Position) - fRadius);
+    float fRingFalloff = lerp(0.5, fHalfWidth, saturate(src.Falloff));
+    return saturate((fHalfWidth - fRingDist) / max(fRingFalloff, 0.5));
+  }
+
   float fDist = length(vDelta);
   float fFalloff = lerp(0.5, fRadius, saturate(src.Falloff));
   return saturate((fRadius - fDist) / max(fFalloff, 0.5));
+}
+
+// Gas: the ambient density at a texel, the field the gas relaxes toward and starts from. Breakup 0 is an even deck at
+// SolverAmbientDensity; towards 1 a noise field carves it into clumps with clear gaps, which a weather map needs so the
+// flow has structure to carry. The noise is fixed to the grid, so a hole the flow opens fills back in with the same
+// pattern it had.
+float FluidGasAmbient(float2 vTexelPos)
+{
+  float fNoise = FluidNoiseFbm(float3(vTexelPos * SolverAmbientFrequency, 0.37)) * 0.5 + 0.5;
+  float fBreakup = saturate(SolverAmbientBreakup);
+  float fMask = saturate((fNoise - fBreakup * 0.55) / max(1.0 - fBreakup * 0.85, 0.05));
+  return SolverAmbientDensity * lerp(1.0, fMask, fBreakup);
 }
 
 // Rankine shape of a Vortex source: rises linearly to 1 at the core radius and falls off as radius / distance outside.

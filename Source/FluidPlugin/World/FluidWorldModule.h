@@ -44,6 +44,12 @@ public:
 
   plUInt32 GetVolumeCount() const { return m_Volumes.GetCount(); }
 
+  /// \brief Restarts the fluid clock that drives emitters, so a test or a cutscene starts from the same time every run.
+  void ResetSimulationClock() { m_FluidTime = plTime::MakeZero(); }
+
+  /// \brief Seconds of fluid time since the module started or ResetSimulationClock.
+  plTime GetSimulationTime() const { return m_FluidTime; }
+
 private:
   /// Last position of a physics actor that fed a volume, for its velocity.
   struct PhysicsTouchState

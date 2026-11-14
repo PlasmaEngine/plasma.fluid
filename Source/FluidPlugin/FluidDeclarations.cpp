@@ -18,6 +18,7 @@ PL_BEGIN_STATIC_REFLECTED_ENUM(plFluidBoundary, 1)
   PL_ENUM_CONSTANT(plFluidBoundary::Open),
   PL_ENUM_CONSTANT(plFluidBoundary::Closed),
   PL_ENUM_CONSTANT(plFluidBoundary::Wrap),
+  PL_ENUM_CONSTANT(plFluidBoundary::Free),
 PL_END_STATIC_REFLECTED_ENUM;
 
 PL_BEGIN_STATIC_REFLECTED_ENUM(plFluidAdvection, 1)
@@ -31,6 +32,7 @@ PL_BEGIN_STATIC_REFLECTED_ENUM(plFluidEmitterShape, 1)
   PL_ENUM_CONSTANT(plFluidEmitterShape::Cone),
   PL_ENUM_CONSTANT(plFluidEmitterShape::Vortex),
   PL_ENUM_CONSTANT(plFluidEmitterShape::Capsule),
+  PL_ENUM_CONSTANT(plFluidEmitterShape::Ring),
 PL_END_STATIC_REFLECTED_ENUM;
 
 PL_BEGIN_STATIC_REFLECTED_ENUM(plFluidBodySource, 1)
@@ -70,6 +72,14 @@ PL_BEGIN_STATIC_REFLECTED_TYPE(plFluidSettings, plNoBase, 2, plRTTIDefaultAlloca
     PL_MEMBER_PROPERTY("Buoyancy", m_fBuoyancy)->AddAttributes(new plDefaultValueAttribute(1.0f), new plClampValueAttribute(-10.0f, 10.0f), new plGroupAttribute("Gas")),
     PL_MEMBER_PROPERTY("AmbientTemperature", m_fAmbientTemperature)->AddAttributes(new plDefaultValueAttribute(0.0f), new plClampValueAttribute(-10.0f, 10.0f), new plGroupAttribute("Gas")),
     PL_MEMBER_PROPERTY("Vorticity", m_fVorticity)->AddAttributes(new plDefaultValueAttribute(0.3f), new plClampValueAttribute(0.0f, 10.0f), new plGroupAttribute("Gas")),
+    PL_MEMBER_PROPERTY("TemperatureDissipation", m_fTemperatureDissipation)->AddAttributes(new plDefaultValueAttribute(0.98f), new plClampValueAttribute(0.0f, 1.0f), new plGroupAttribute("Gas")),
+    PL_MEMBER_PROPERTY("DensityWeight", m_fDensityWeight)->AddAttributes(new plDefaultValueAttribute(0.1f), new plClampValueAttribute(-10.0f, 10.0f), new plGroupAttribute("Gas")),
+    PL_MEMBER_PROPERTY("WarmStartPressure", m_bWarmStartPressure)->AddAttributes(new plDefaultValueAttribute(false), new plGroupAttribute("Gas")),
+    PL_MEMBER_PROPERTY("DrainRemovesGas", m_bDrainRemovesGas)->AddAttributes(new plDefaultValueAttribute(true), new plGroupAttribute("Gas")),
+    PL_MEMBER_PROPERTY("AmbientDensity", m_fAmbientDensity)->AddAttributes(new plDefaultValueAttribute(0.0f), new plClampValueAttribute(0.0f, 10.0f), new plGroupAttribute("Gas")),
+    PL_MEMBER_PROPERTY("AmbientRate", m_fAmbientRate)->AddAttributes(new plDefaultValueAttribute(0.0f), new plClampValueAttribute(0.0f, 10.0f), new plSuffixAttribute("/sec"), new plGroupAttribute("Gas")),
+    PL_MEMBER_PROPERTY("AmbientScale", m_fAmbientScale)->AddAttributes(new plDefaultValueAttribute(2000.0f), new plClampValueAttribute(0.1f, plVariant()), new plSuffixAttribute(" m"), new plGroupAttribute("Gas")),
+    PL_MEMBER_PROPERTY("AmbientBreakup", m_fAmbientBreakup)->AddAttributes(new plDefaultValueAttribute(0.5f), new plClampValueAttribute(0.0f, 1.0f), new plGroupAttribute("Gas")),
 
     PL_MEMBER_PROPERTY("Depth", m_fDepth)->AddAttributes(new plDefaultValueAttribute(2.0f), new plClampValueAttribute(0.05f, 100.0f), new plSuffixAttribute(" m"), new plGroupAttribute("Water")),
     PL_MEMBER_PROPERTY("Damping", m_fDamping)->AddAttributes(new plDefaultValueAttribute(0.004f), new plClampValueAttribute(0.0f, 1.0f), new plGroupAttribute("Water")),
@@ -183,6 +193,16 @@ void plFluidSettings::Save(plStreamWriter& inout_stream) const
 
   inout_stream << m_fHeightScale;
   inout_stream << m_fEdgeFade;
+
+  // Version 7: Gas density weight, warm start and the ambient field.
+  inout_stream << m_fTemperatureDissipation;
+  inout_stream << m_fDensityWeight;
+  inout_stream << m_bWarmStartPressure;
+  inout_stream << m_bDrainRemovesGas;
+  inout_stream << m_fAmbientDensity;
+  inout_stream << m_fAmbientRate;
+  inout_stream << m_fAmbientScale;
+  inout_stream << m_fAmbientBreakup;
 }
 
 namespace
@@ -214,7 +234,7 @@ plResult plFluidSettings::Load(plStreamReader& inout_stream, plUInt8 uiVersion)
 
   // Out of range values come from corrupt data and fall back to the enum default.
   m_Mode = plFluidMode::FromStoredValue(uiMode);
-  m_Boundary.SetValue(uiBoundary <= plFluidBoundary::Wrap ? uiBoundary : (plUInt8)plFluidBoundary::Default);
+  m_Boundary.SetValue(uiBoundary <= plFluidBoundary::Free ? uiBoundary : (plUInt8)plFluidBoundary::Default);
   m_Advection.SetValue(uiAdvection <= plFluidAdvection::MacCormack ? uiAdvection : (plUInt8)plFluidAdvection::Default);
 
   inout_stream >> m_uiResolution;
@@ -266,6 +286,20 @@ plResult plFluidSettings::Load(plStreamReader& inout_stream, plUInt8 uiVersion)
 
     inout_stream >> m_fHeightScale;
     inout_stream >> m_fEdgeFade;
+
+    // Before version 7 temperature decayed with the density.
+    m_fTemperatureDissipation = m_fDensityDissipation;
+    if (uiVersion >= 7)
+    {
+      inout_stream >> m_fTemperatureDissipation;
+      inout_stream >> m_fDensityWeight;
+      inout_stream >> m_bWarmStartPressure;
+      inout_stream >> m_bDrainRemovesGas;
+      inout_stream >> m_fAmbientDensity;
+      inout_stream >> m_fAmbientRate;
+      inout_stream >> m_fAmbientScale;
+      inout_stream >> m_fAmbientBreakup;
+    }
     return PL_SUCCESS;
   }
 
@@ -318,6 +352,8 @@ plResult plFluidSettings::Load(plStreamReader& inout_stream, plUInt8 uiVersion)
     inout_stream >> fUnused;
   }
 
+  // Before version 7 temperature decayed with the density.
+  m_fTemperatureDissipation = m_fDensityDissipation;
   return PL_SUCCESS;
 }
 

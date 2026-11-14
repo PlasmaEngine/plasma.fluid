@@ -10,7 +10,8 @@ ALL
 
 // Fills a freshly created state texture with the volume's starting state. Runs once per texture, when a volume is
 // created or changes resolution or mode; the other solver textures are fully rewritten every frame and never need it.
-// Snow starts at its Initial Depth so a volume has something to trample before any snow has fallen.
+// Snow starts at its Initial Depth so a volume has something to trample before any snow has fallen; Gas starts as its
+// ambient field.
 
 RWTexture2D<float4> FluidClearTarget BIND_GROUP(BG_DRAW_CALL);
 
@@ -20,5 +21,11 @@ void main(uint3 id : SV_DispatchThreadID)
   if (FluidOutOfGrid(id.xy))
     return;
 
-  FluidClearTarget[id.xy] = SolverInitialState;
+  float4 state = SolverInitialState;
+
+  // Gas with an ambient field starts as that field, so a sky volume has its clouds from the first frame.
+  if (SolverMode == FLUID_MODE_GAS && SolverAmbientDensity > 0.0)
+    state.z = FluidGasAmbient(float2(id.xy) + 0.5);
+
+  FluidClearTarget[id.xy] = state;
 }

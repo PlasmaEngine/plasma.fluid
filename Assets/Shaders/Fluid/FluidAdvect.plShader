@@ -61,7 +61,8 @@ void main(uint3 id : SV_DispatchThreadID)
   }
 
   advected.xy *= SolverVelocityDissipation;
-  advected.zw *= SolverDensityDissipation;
+  advected.z *= SolverDensityDissipation;
+  advected.w *= SolverMode == FLUID_MODE_GAS ? SolverTemperatureDissipation : SolverDensityDissipation;
 
   FluidStateOutput[id.xy] = advected;
 }

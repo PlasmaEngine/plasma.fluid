@@ -49,6 +49,7 @@
 #define FLUID_SOURCE_CONE 2
 #define FLUID_SOURCE_VORTEX 3 // Gas, Water: swirls the flow around the source's centre, optionally draining it inward
 #define FLUID_SOURCE_CAPSULE 4 // a segment Position +- Axis with Radius around it: bones of a character or ragdoll
+#define FLUID_SOURCE_RING 5    // Gas: an annulus of Radius around Position, Extents.x half width: an eyewall, a shock front
 
 #define FLUID_COLLIDER_SPHERE 0
 #define FLUID_COLLIDER_BOX 1
@@ -57,9 +58,12 @@
 #define FLUID_BOUNDARY_OPEN 0
 #define FLUID_BOUNDARY_CLOSED 1
 #define FLUID_BOUNDARY_WRAP 2
+#define FLUID_BOUNDARY_FREE 3 // Gas: open air at rest pressure beyond the border; flow crosses it both ways
 
 // SolverFlags
 #define FLUID_FLAG_MACCORMACK 0x1
+#define FLUID_FLAG_WARM_START 0x2 // Gas: the pressure solve starts from last step's pressure instead of zero
+#define FLUID_FLAG_DRAIN_KEEPS_GAS 0x4 // Gas: a draining vortex pulls the flow in without removing the gas in its core
 
 // Water: a source's HeightImpulse (m/s) acts on the surface as a pressure head of HeightImpulse * this many seconds,
 // metres of water. Pressure moves water without adding or removing any, so a floating body keeps its dent and a
@@ -144,6 +148,16 @@ CONSTANT_BUFFER2(plFluidSolverConstants, 2, BG_DRAW_CALL)
   FLOAT1(SolverChopRate);       // Water: how fast the chop field changes, per second
   FLOAT1(SolverTurbulence);     // Gas, Water: 0..1, how unsteadily vortices turn
   FLOAT1(SolverTurbulencePadding0);
+
+  FLOAT1(SolverDensityWeight);    // Gas: m/s^2 along the plane's -Y per unit of density (the weight of dense smoke)
+  FLOAT1(SolverAmbientDensity);   // Gas: density of the ambient field, 0 for none (see FluidGasAmbient)
+  FLOAT1(SolverAmbientRelax);     // Gas: share of the way to the ambient field the density moves this step
+  FLOAT1(SolverAmbientFrequency); // Gas: noise cycles per texel of the ambient field
+
+  FLOAT1(SolverAmbientBreakup);   // Gas: 0 an even deck at Ambient Density, 1 scattered clumps with clear sky between
+  FLOAT1(SolverTemperatureDissipation); // Gas: fraction of temperature surviving one step
+  FLOAT1(SolverAmbientPadding1);
+  FLOAT1(SolverAmbientPadding2);
 };
 
 // The bed: how the ground under a volume sits relative to its plane. Baked on the CPU by raycasting the scene's static
@@ -175,7 +189,8 @@ struct PL_SHADER_STRUCT plFluidSourceGpu
   FLOAT1(HeightFade); // 0..1, how much the source's distance from the plane weakens it
 
   FLOAT1(Swirl);          // Vortex: tangential speed at the edge of the core, m/s; positive turns counter-clockwise seen from +Z
-  FLOAT1(Drain);          // Vortex: inflow speed pulled toward the centre, m/s; 0 is pure rotation
+  FLOAT1(Drain);          // Vortex: inflow speed pulled toward the centre, m/s; 0 is pure rotation, negative pushes the flow
+                          // outward (a source: air rising into the plane, a blast)
   FLOAT2(Axis);           // Box: unit direction of the box's local X in the plane (zero = axis aligned).
                           // Capsule: half the segment in texels; the capsule spans Position - Axis .. Position + Axis
 };

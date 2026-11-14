@@ -22,7 +22,7 @@ PL_BEGIN_COMPONENT_TYPE(plFluidEmitterComponent, 2, plComponentMode::Dynamic)
     PL_MEMBER_PROPERTY("Burst", m_bBurst),
     PL_MEMBER_PROPERTY("Trail", m_bTrail)->AddAttributes(new plDefaultValueAttribute(true)),
     PL_MEMBER_PROPERTY("Swirl", m_fSwirl)->AddAttributes(new plDefaultValueAttribute(0.0f), new plSuffixAttribute(" m/s")),
-    PL_MEMBER_PROPERTY("Drain", m_fDrain)->AddAttributes(new plDefaultValueAttribute(0.0f), new plClampValueAttribute(0.0f, plVariant()), new plSuffixAttribute(" m/s")),
+    PL_MEMBER_PROPERTY("Drain", m_fDrain)->AddAttributes(new plDefaultValueAttribute(0.0f), new plSuffixAttribute(" m/s")),
     PL_MEMBER_PROPERTY("OscillationPeriod", m_fOscillationPeriod)->AddAttributes(new plDefaultValueAttribute(0.0f), new plClampValueAttribute(0.0f, plVariant()), new plSuffixAttribute(" sec")),
   }
   PL_END_PROPERTIES;
@@ -116,7 +116,8 @@ bool plFluidEmitterComponent::FillSource(plFluidWorldSource& out_source, plTime 
   out_source.m_fPress = m_fPress;
   out_source.m_fFalloff = plMath::Clamp(m_fFalloff, 0.0f, 1.0f);
   out_source.m_fSwirl = m_fSwirl;
-  out_source.m_fDrain = plMath::Max(m_fDrain, 0.0f);
+  // Negative drains push outward (Gas); Water clamps them to zero itself.
+  out_source.m_fDrain = m_fDrain;
 
   // The phase follows the fluid's own clock, so every oscillating emitter of a world stays in step, and a swell keeps
   // rolling in the editor while the world clock is paused.
